@@ -21,7 +21,8 @@ from lmdeploy.serve.openai.protocol import (  # noqa: E501
     EmbeddingsRequest, ErrorResponse, GenerateRequest, GenerateResponse,
     ModelCard, ModelList, ModelPermission, UsageInfo)
 
-os.environ['TM_LOG_LEVEL'] = 'ERROR'
+if os.environ['TM_LOG_LEVEL'] is None or os.environ['TM_LOG_LEVEL'] == '':
+    os.environ['TM_LOG_LEVEL'] = 'INFO'
 
 
 class VariableInterface:
@@ -31,6 +32,18 @@ class VariableInterface:
 
 
 app = FastAPI(docs_url='/')
+
+from prometheus_fastapi_instrumentator import Instrumentator
+instrumentator = Instrumentator(
+    should_group_status_codes=False,
+    should_ignore_untemplated=True,
+    should_respect_env_var=True,
+    excluded_handlers=[".*admin.*", "/metrics"],
+).instrument(app)
+
+@app.on_event("startup")
+async def _startup():
+    instrumentator.expose(app)
 
 
 def get_model_list():
