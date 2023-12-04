@@ -2,3 +2,4 @@
 -r requirements/runtime.txt
 -r requirements/lite.txt
 -r requirements/serve.txt
+prometheus_fastapi_instrumentator
