@@ -22,8 +22,23 @@ from lmdeploy.serve.openai.protocol import (  # noqa: E501
     GenerateRequest, GenerateResponse, ModelCard, ModelList, ModelPermission,
     UsageInfo)
 
+import logging
+
+_logger = logging.getLogger()
+_logger.setLevel("INFO")
+
+
+# body logger
+def body_logger(request, raw_request: Request, start_time: float):
+    request_body = request.model_dump_json()
+    process_time = time.time() - start_time
+    request_id = raw_request.headers.get('X-Request-ID') if raw_request.headers.get('X-Request-ID') else ''
+    logging.info(
+        f'receive request: id: {request_id}, body: {request_body}, time: {process_time}')
+
+
 if not 'TM_LOG_LEVEL' in os.environ or os.environ['TM_LOG_LEVEL'] == '':
-    os.environ['TM_LOG_LEVEL'] = 'INFO'
+    os.environ['TM_LOG_LEVEL'] = 'ERROR'
 
 class VariableInterface:
     """A IO interface maintaining variables."""
@@ -48,28 +63,6 @@ instrumentator = Instrumentator(
 async def _startup():
     # set ENABLE_METRICS to True to enable metrics
     instrumentator.expose(app)
-
-
-import logging
-
-_logger = logging.getLogger(__name__)
-_logger.setLevel(os.environ['TM_LOG_LEVEL'])
-
-
-@app.middleware("http")
-# body logger
-async def body_logger(request: Request, call_next):
-    # only log chat/completions and completions
-    if request.url.path != '/v1/chat/completions' and request.url.path != '/v1/completions':
-        return await call_next(request)
-    start_time = time.time()
-    response = await call_next(request)
-    process_time = time.time() - start_time
-    request_id = request.headers.get('X-Request-ID')
-    _logger.info(
-        f"receive request: {request_id} {request.method} {request.url.path} {request.body} {response.status_code} {process_time}"
-    )
-    return response
 
 
 def get_model_list():
@@ -156,6 +149,7 @@ async def chat_completions_v1(request: ChatCompletionRequest,
     - presence_penalty (replaced with repetition_penalty)
     - frequency_penalty (replaced with repetition_penalty)
     """
+    start_time = time.time()
     if request.session_id == -1:
         request.session_id = random.randint(1, 10086)
     error_check_ret = await check_request(request)
@@ -266,6 +260,7 @@ async def chat_completions_v1(request: ChatCompletionRequest,
         choices=choices,
         usage=usage,
     )
+    body_logger(request, raw_request, start_time)
 
     return response
 
