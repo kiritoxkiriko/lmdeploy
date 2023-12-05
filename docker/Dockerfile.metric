@@ -1,9 +1,11 @@
 ARG VERSION=v0.0.14
 
-FROM adas-img.nioint.com/inference/openmmlab/lmdeploy:${VERSION}
+FROM openmmlab/lmdeploy:${VERSION}
 
 ENV PIP_INDEX_URL=https://mirrors.sustech.edu.cn/pypi/web/simple
 
-pip install --no-cache-dir prometheus_fastapi_instrumentator
+ENV ENABLE_METRICS=1
 
-COPY ../lmdeploy/serve/openai/api_server.py /usr/local/lib/python3.8/dist-packages/lmdeploy/serve/openai/api_server.py
+RUN pip install --no-cache-dir prometheus_fastapi_instrumentator
+
+COPY ./lmdeploy/serve/openai/api_server.py /usr/local/lib/python3.8/dist-packages/lmdeploy/serve/openai/api_server.py
