@@ -1,4 +1,4 @@
-ARG VERSION=v0.0.14
+ARG VERSION=v0.1.0a1
 
 FROM openmmlab/lmdeploy:${VERSION}
 
