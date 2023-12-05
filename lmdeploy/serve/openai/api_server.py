@@ -22,7 +22,7 @@ from lmdeploy.serve.openai.protocol import (  # noqa: E501
     GenerateRequest, GenerateResponse, ModelCard, ModelList, ModelPermission,
     UsageInfo)
 
-if os.environ['TM_LOG_LEVEL'] is None or os.environ['TM_LOG_LEVEL'] == '':
+if not 'TM_LOG_LEVEL' in os.environ or os.environ['TM_LOG_LEVEL'] == '':
     os.environ['TM_LOG_LEVEL'] = 'INFO'
 
 class VariableInterface:
@@ -43,7 +43,15 @@ instrumentator = Instrumentator(
 
 @app.on_event("startup")
 async def _startup():
+    # set ENABLE_METRICS to True to enable metrics
     instrumentator.expose(app)
+
+
+@app.middleware("http")
+# add body logger
+async def add_logger(request: Request, call_next):
+    pass
+
 
 
 def get_model_list():
