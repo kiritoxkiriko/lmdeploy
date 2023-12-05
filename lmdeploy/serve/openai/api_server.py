@@ -33,7 +33,9 @@ class VariableInterface:
 
 app = FastAPI(docs_url='/')
 
+## add metrics
 from prometheus_fastapi_instrumentator import Instrumentator
+
 instrumentator = Instrumentator(
     should_group_status_codes=False,
     should_ignore_untemplated=True,
@@ -41,17 +43,33 @@ instrumentator = Instrumentator(
     excluded_handlers=[".*admin.*", "/metrics"],
 ).instrument(app)
 
+
 @app.on_event("startup")
 async def _startup():
     # set ENABLE_METRICS to True to enable metrics
     instrumentator.expose(app)
 
 
-@app.middleware("http")
-# add body logger
-async def add_logger(request: Request, call_next):
-    pass
+import logging
 
+_logger = logging.getLogger(__name__)
+_logger.setLevel(os.environ['TM_LOG_LEVEL'])
+
+
+@app.middleware("http")
+# body logger
+async def body_logger(request: Request, call_next):
+    # only log chat/completions and completions
+    if request.url.path != '/v1/chat/completions' and request.url.path != '/v1/completions':
+        return await call_next(request)
+    start_time = time.time()
+    response = await call_next(request)
+    process_time = time.time() - start_time
+    request_id = request.headers.get('X-Request-ID')
+    _logger.info(
+        f"receive request: {request_id} {request.method} {request.url.path} {request.body} {response.status_code} {process_time}"
+    )
+    return response
 
 
 def get_model_list():
@@ -162,9 +180,9 @@ async def chat_completions_v1(request: ChatCompletionRequest,
         ignore_eos=request.ignore_eos)
 
     def create_stream_response_json(
-        index: int,
-        text: str,
-        finish_reason: Optional[str] = None,
+            index: int,
+            text: str,
+            finish_reason: Optional[str] = None,
     ) -> str:
         choice_data = ChatCompletionResponseStreamChoice(
             index=index,
@@ -311,9 +329,9 @@ async def completions_v1(request: CompletionRequest,
         generators.append(result_generator)
 
     def create_stream_response_json(
-        index: int,
-        text: str,
-        finish_reason: Optional[str] = None,
+            index: int,
+            text: str,
+            finish_reason: Optional[str] = None,
     ) -> str:
         choice_data = CompletionResponseStreamChoice(
             index=index,
@@ -518,6 +536,11 @@ def main(model_path: str,
         allow_methods (List[str]): a list of allowed HTTP methods for CORS
         allow_headers (List[str]): a list of allowed HTTP headers for CORS
     """
+    # add body logger
+    app.add_middleware(
+        body_logger,
+    )
+
     if allow_origins:
         app.add_middleware(
             CORSMiddleware,
