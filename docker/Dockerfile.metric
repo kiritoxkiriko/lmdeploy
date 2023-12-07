@@ -4,8 +4,8 @@ FROM openmmlab/lmdeploy:${VERSION}
 
 ENV PIP_INDEX_URL=https://mirrors.sustech.edu.cn/pypi/web/simple
 
-ENV ENABLE_METRICS=1
-
 RUN pip install --no-cache-dir prometheus_fastapi_instrumentator
+
+ENV ENABLE_METRICS=1
 
 COPY ./lmdeploy/serve/openai/api_server.py /usr/local/lib/python3.8/dist-packages/lmdeploy/serve/openai/api_server.py

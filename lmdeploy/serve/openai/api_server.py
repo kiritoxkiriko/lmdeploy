@@ -23,16 +23,15 @@ from lmdeploy.serve.openai.protocol import (  # noqa: E501
 
 import logging
 
-_logger = logging.getLogger()
-_logger.setLevel("INFO")
+_logger = logging.getLogger('uvicorn.error')
 
 
 # body logger
 def body_logger(request, raw_request: Request, start_time: float):
     request_body = request.model_dump_json()
     process_time = time.time() - start_time
-    request_id = raw_request.headers.get('X-Request-ID') if raw_request.headers.get('X-Request-ID') else ''
-    logging.info(
+    request_id = raw_request.headers.get('X-NADP-RequestID')
+    _logger.info(
         f'receive request: id: {request_id}, body: {request_body}, time: {process_time}')
 
 
