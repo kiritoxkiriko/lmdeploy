@@ -220,6 +220,7 @@ async def chat_completions_v1(request: ChatCompletionRequest,
 
     # Streaming response
     if request.stream:
+        body_logger(request, raw_request, start_time)
         return StreamingResponse(completion_stream_generator(),
                                  media_type='text/event-stream')
 
