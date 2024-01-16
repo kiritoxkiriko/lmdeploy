@@ -32,8 +32,8 @@ jobs:
     runs-on: ubuntu-latest
     environment: 'prod'
     env:
-      TAG_PREFIX: "openmmlab/lmdeploy"
-      TAG: "openmmlab/lmdeploy:latest"
+      TAG_PREFIX: "kiritoxkiriko/lmdeploy"
+      TAG: "kiritoxkiriko/lmdeploy:latest"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
