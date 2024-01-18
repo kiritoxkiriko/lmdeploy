@@ -1,8 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import asyncio
 import copy
-import io
-import json
 import logging
 import os.path as osp
 import sys
@@ -10,7 +8,7 @@ from configparser import ConfigParser
 from contextlib import contextmanager
 from queue import Queue
 from threading import Thread
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Union
 
 import numpy as np
 import torch
@@ -18,16 +16,18 @@ from huggingface_hub import snapshot_download
 from torch.nn.utils.rnn import pad_sequence
 
 import lmdeploy
-from lmdeploy.model import MODELS, BaseModel
+from lmdeploy.messages import (EngineGenerationConfig, ResponseType,
+                               TurbomindEngineConfig)
+from lmdeploy.model import (MODELS, BaseModel, ChatTemplateConfig,
+                            best_match_model)
 from lmdeploy.tokenizer import Tokenizer
-from lmdeploy.utils import get_logger
+from lmdeploy.utils import _stop_words, get_logger
 
 from .deploy.converter import (get_model_format, supported_formats,
                                update_config_weight_type, update_output_format)
 from .deploy.source_model.base import INPUT_MODELS
 from .deploy.target_model.base import OUTPUT_MODELS, TurbomindModelConfig
-from .utils import (ModelSource, check_tm_model_input, create_hf_download_args,
-                    get_hf_config_content, get_model_source)
+from .utils import ModelSource, create_hf_download_args, get_model_source
 
 # TODO: find another way import _turbomind
 lmdeploy_dir = osp.split(lmdeploy.__file__)[0]
@@ -37,24 +37,12 @@ import _turbomind as _tm  # noqa: E402
 logger = logging.getLogger(__name__)
 
 
-def _stop_words(stop_words: List[str], tokenizer: Tokenizer):
-    """return list of stop-words to numpy.ndarray."""
-    if stop_words is None:
+def _construct_stop_or_bad_words(words: List[int] = None):
+    if words is None or len(words) == 0:
         return None
-    assert isinstance(stop_words, List) and \
-        all(isinstance(elem, str) for elem in stop_words), \
-        f'stop_words must be a list but got {type(stop_words)}'
-    stop_words = [
-        tokenizer.encode(stop_word, False)[-1] for stop_word in stop_words
-    ]
-    assert isinstance(stop_words, List) and all(
-        isinstance(elem, int) for elem in stop_words), 'invalid stop_words'
-    # each id in stop_words represents a stop word
-    # refer to https://github.com/fauxpilot/fauxpilot/discussions/165 for
-    # detailed explanation about fastertransformer's stop_words
-    stop_word_offsets = range(1, len(stop_words) + 1)
-    stop_words = np.array([[stop_words, stop_word_offsets]]).astype(np.int32)
-    return stop_words
+    offsets = range(1, len(words) + 1)
+    combined = np.array([[words, offsets]]).astype(np.int32)
+    return combined
 
 
 def _np_dict_to_tm_dict(np_dict: dict):
@@ -75,6 +63,28 @@ def _tm_dict_to_torch_dict(tm_dict: _tm.TensorMap):
         ret[k] = torch.from_dlpack(v)
 
     return ret
+
+
+def _update_engine_config(config: TurbomindEngineConfig, **kwargs):
+    if config is None:
+        config = TurbomindEngineConfig()
+    for k, v in kwargs.items():
+        if v and hasattr(config, k):
+            setattr(config, k, v)
+            get_logger('turbomind').warning(
+                f'kwargs {k} is deprecated to initialize model, '
+                'use TurbomindEngineConfig instead.')
+    return config
+
+
+def _update_tm_config(dst: TurbomindModelConfig, src: TurbomindEngineConfig):
+    dst_dict = copy.deepcopy(dst.__dict__)
+    src_dict = copy.deepcopy(src.__dict__)
+    src_dict['tensor_para_size'] = src_dict['tp']
+    for k, v in src_dict.items():
+        if v is not None and k in dst_dict:
+            dst_dict[k] = v
+    return TurbomindModelConfig.from_dict(dst_dict)
 
 
 @contextmanager
@@ -102,34 +112,87 @@ class TurboMind:
 
     def __init__(self,
                  model_path: str,
+                 engine_config: TurbomindEngineConfig = None,
                  model_source: ModelSource = ModelSource.WORKSPACE,
                  model_name: Optional[str] = None,
                  model_format: Optional[str] = None,
                  group_size: Optional[int] = None,
                  tp: Optional[int] = None,
+                 chat_template_config: Optional[ChatTemplateConfig] = None,
                  **kwargs):
-        if tp is not None:
-            assert ((tp & (tp - 1) == 0) and tp != 0), 'tp should be 2^n'
-        self.gpu_count = tp if tp is not None else 1
+
+        # check model_name equal in engine_config and passed in
+        if engine_config is not None and engine_config.model_name is not None:
+            if model_name is not None:
+                assert model_name == engine_config.model_name, 'Got different'
+                f' model names. model_name: {model_name}, engine_config model '
+                f'name: {engine_config.model_name}'
+
+        # if loading from workspace and engine_config is None, use config.ini
+        # and ignore passed args like model_format, tp, etc.
+        if model_source == ModelSource.WORKSPACE and engine_config is None:
+
+            def _catch_args(**kwargs):
+                args = []
+                for k, v in kwargs.items():
+                    if v and hasattr(TurbomindEngineConfig, k):
+                        args.append(k)
+                return args
+
+            args = _catch_args(**kwargs,
+                               model_name=model_name,
+                               model_format=model_format,
+                               tp=tp)
+            if len(args) > 0:
+                get_logger('turbomind').warning(
+                    f'loading from workspace, ignore args {args} '
+                    'please use TurbomindEngineConfig or modify config.ini')
+
+        else:
+            engine_config = _update_engine_config(engine_config,
+                                                  model_name=model_name,
+                                                  model_format=model_format,
+                                                  group_size=group_size,
+                                                  tp=tp,
+                                                  **kwargs)
+
+        # match model name
+        if model_source == ModelSource.HF_MODEL and \
+                engine_config.model_name is None:
+            potential_names = best_match_model(model_path)
+            if potential_names is None:
+                logger.warning(f'Please input a model_name for {model_source}')
+            else:
+                engine_config.model_name = potential_names
+                logger.warning('Best matched chat template name: '
+                               f'{engine_config.model_name}')
+
+        tp = engine_config.tp if engine_config is not None else 1
+        assert ((tp & (tp - 1) == 0) and tp != 0), 'tp should be 2^n'
+        self.gpu_count = tp
 
         if model_source == ModelSource.WORKSPACE:
             tokenizer_model_path = osp.join(model_path, 'triton_models',
                                             'tokenizer')
             self.tokenizer = Tokenizer(tokenizer_model_path)
-            self.model_comm = self._from_workspace(model_path)
+            self.model_comm = self._from_workspace(model_path=model_path,
+                                                   engine_config=engine_config)
         else:
             self.tokenizer = Tokenizer(model_path)
             self.model_comm = self._from_hf(model_source=model_source,
                                             model_path=model_path,
-                                            model_name=model_name,
-                                            model_format=model_format,
-                                            group_size=group_size,
-                                            tp=tp,
-                                            **kwargs)
+                                            engine_config=engine_config)
 
+        if chat_template_config:
+            if chat_template_config.model_name is None:
+                chat_template_config.model_name = self.model_name
+                logger.warning(f'Input chat template with model_name is None. '
+                               f'Forcing to use {self.model_name}')
+            self.model = chat_template_config.chat_template
+        else:
+            self.model: BaseModel = MODELS.get(self.model_name)(**kwargs)
+        self.session_len = self.config.session_len
         self.eos_id = self.tokenizer.eos_token_id
-        self.model: BaseModel = MODELS.get(self.model_name)(**kwargs)
-        self.session_len = self.model.session_len
         self.stop_words = _stop_words(self.model.stop_words, self.tokenizer)
 
     def _create_weight(self, model_comm):
@@ -194,69 +257,38 @@ class TurboMind:
                     tm_params[k] = []
                 tm_params[k].append(v)
 
-    def _from_hf(self,
-                 model_source: ModelSource,
-                 model_path: str,
-                 model_name: Optional[str] = None,
-                 model_format: Optional[str] = None,
-                 group_size: Optional[int] = None,
-                 tp: Optional[int] = None,
-                 **kwargs):
+    def _from_hf(self, model_source: ModelSource, model_path: str,
+                 engine_config: TurbomindEngineConfig):
         """Load model which is in hf format."""
-        # get model_name, group_size if is lmdeploy managed.
-        if model_source == ModelSource.HF_LMDEPLOY:
-            config = get_hf_config_content(model_path, local_files_only=True)
-            tm_config = config['turbomind']
-            tm_config.update(kwargs)
-            var_shoud_be_none = dict(model_name=model_name,
-                                     model_format=model_format,
-                                     group_size=group_size)
-            for key, value in var_shoud_be_none.items():
-                assert value is None, f'{key} should be None when model is '\
-                    f'from {model_source}'
-            model_name = tm_config['model_name']
-            group_size = tm_config['group_size']
-            if tm_config['weight_type'] == 'int4':
-                model_format = 'awq'
-        else:
-            assert model_name is not None, 'please supply model_name when ' \
-                f'model is form {model_source}'
-            if osp.exists(osp.join(model_path, 'outputs_stats.pth')):
-                model_format = 'awq' if model_format is None else model_format
-                group_size = 128 if group_size is None else group_size
-            tm_config = kwargs
-
-        assert model_name in MODELS.module_dict.keys(), \
-            f"'{model_name}' is not supported. " \
+        assert model_source == ModelSource.HF_MODEL, \
+            f'{model_source} is not supported'
+        assert engine_config.model_name in MODELS.module_dict.keys(), \
+            f"'{engine_config.model_name}' is not supported. " \
             f'The supported models are: {MODELS.module_dict.keys()}'
-        assert model_format in supported_formats, 'the model format ' \
-            f'should be in {supported_formats}'
+        assert engine_config.model_format in supported_formats, \
+            f'The model format should be in {supported_formats}'
+
+        # update model_format if not supplied and outputs_stats.pth exists
+        if osp.exists(osp.join(model_path, 'outputs_stats.pth')) and \
+                engine_config.model_format is None:
+            engine_config.model_format = 'awq'
 
         data_type = 'fp16'
         output_format = 'fp16'
-        inferred_model_format = get_model_format(model_name, model_format)
-        cfg = TurbomindModelConfig.from_dict(tm_config, allow_none=True)
-
-        # overwrite with input params
-        cfg.model_name = model_name
-        cfg.tensor_para_size = 1 if tp is None else tp
-        cfg.rotary_embedding = cfg.size_per_head
-        cfg.group_size = group_size
+        inferred_model_format = get_model_format(engine_config.model_name,
+                                                 engine_config.model_format)
+        cfg = TurbomindModelConfig.from_engine_config(engine_config)
         if inferred_model_format.find('awq') != -1:
             cfg.weight_type = 'int4'
             output_format = 'w4'
             data_type = 'int4'
-            assert group_size > 0, f'group_size: {group_size} should > 0'
+            cfg.group_size = 128
         else:
-            output_format = update_output_format(model_name,
+            output_format = update_output_format(engine_config.model_name,
                                                  inferred_model_format,
                                                  model_path, output_format)
             data_type = output_format
             update_config_weight_type(output_format, cfg)
-
-        self.config = cfg
-        self.model_name = model_name
-        self.data_type = data_type
 
         input_model = INPUT_MODELS.get(inferred_model_format)(
             model_path=model_path, tokenizer_path=model_path, ckpt_path=None)
@@ -264,18 +296,19 @@ class TurboMind:
         output_model = OUTPUT_MODELS.get(output_format)(
             input_model=input_model, cfg=cfg, to_file=False, out_dir='')
 
-        config = copy.deepcopy(output_model.cfg.__dict__)
-        logger.warning(f'model_config:\n{json.dumps(config, indent=2)}')
-        parser = ConfigParser()
-        parser['llama'] = config
-        with io.StringIO() as ss:
-            parser.write(ss)
-            ss.seek(0)
-            config = ss.read()
+        cfg = output_model.cfg
+        if engine_config.session_len is not None:
+            cfg.session_len = engine_config.session_len
+
+        self.config = cfg
+        self.model_name = engine_config.model_name
+        self.data_type = data_type
+
+        logger.warning(f'model_config:\n\n{cfg.toini()}')
 
         model_comm = _tm.AbstractTransformerModel.create_llama_model(
             model_dir='',
-            config=config,
+            config=cfg.toini(),
             tensor_para_size=self.gpu_count,
             data_type=data_type)
 
@@ -289,35 +322,49 @@ class TurboMind:
         output_model.export()
 
         # load kv qparams
-        self._load_kv_qparams(model_path, tm_params, **kwargs)
+        self._load_kv_qparams(model_path, tm_params, kv_sym=False, kv_bits=8)
         assert len(tm_params) == 0, f'missing {tm_params.keys()}'
 
         return model_comm
 
-    def _from_workspace(self, model_path: str):
+    def _from_workspace(self, model_path: str,
+                        engine_config: TurbomindEngineConfig):
         """Load model which is converted by `lmdeploy convert`"""
         ini_path = osp.join(model_path, 'triton_models', 'weights',
                             'config.ini')
+        # load cfg
         with open(ini_path, 'r') as f:
             parser = ConfigParser()
             parser.read_file(f)
-            section_name = 'llama'
-            tp_cfg = parser.getint(section_name, 'tensor_para_size')
+        section_name = 'llama'
+        _cfg = parser._sections[section_name]
+        cfg = TurbomindModelConfig.from_dict(_cfg)
 
-            if tp_cfg != 1 and tp_cfg != self.gpu_count:
-                get_logger('turbomind').info(
-                    f'found tp={tp_cfg} in config.ini.')
-                self.gpu_count = tp_cfg
-            self.model_name = parser.get(section_name, 'model_name')
-            self.data_type = parser.get(section_name, 'weight_type')
-            cfg = parser._sections[section_name]
-            cfg = TurbomindModelConfig.from_dict(cfg)
-            self.config = cfg
+        # check whether input tp is valid
+        if cfg.tensor_para_size != 1 and \
+                self.gpu_count != cfg.tensor_para_size:
+            get_logger('turbomind').info(
+                f'found tp={cfg.tensor_para_size} in config.ini.')
+            self.gpu_count = cfg.tensor_para_size
+
+        # update cfg
+        if engine_config is not None:
+            engine_config.tp = cfg.tensor_para_size
+            cfg = _update_tm_config(cfg, engine_config)
+            if engine_config.session_len is not None:
+                cfg.session_len = engine_config.session_len
+
+        # update cls
+        self.config = cfg
+        self.model_name = cfg.model_name
+        self.data_type = cfg.weight_type
 
         # create model
+        logger.warning(f'model_config:\n\n{cfg.toini()}')
         weight_dir = osp.join(model_path, 'triton_models', 'weights')
         model_comm = _tm.AbstractTransformerModel.create_llama_model(
-            weight_dir,
+            model_dir=weight_dir,
+            config=cfg.toini(),
             tensor_para_size=self.gpu_count,
             data_type=self.data_type)
 
@@ -326,13 +373,16 @@ class TurboMind:
         return model_comm
 
     @classmethod
-    def from_pretrained(cls,
-                        pretrained_model_name_or_path: str,
-                        model_name: Optional[str] = None,
-                        model_format: Optional[str] = None,
-                        group_size: Optional[int] = None,
-                        tp: Optional[int] = None,
-                        **kwargs):
+    def from_pretrained(
+            cls,
+            pretrained_model_name_or_path: str,
+            engine_config: TurbomindEngineConfig = None,
+            model_name: Optional[str] = None,
+            model_format: Optional[str] = None,
+            group_size: Optional[int] = None,
+            tp: Optional[int] = None,
+            chat_template_config: Optional[ChatTemplateConfig] = None,
+            **kwargs):
         """LMDeploy's turbomind inference engine.
 
         Args:
@@ -346,7 +396,7 @@ class TurboMind:
                       "InternLM/internlm-chat-20b-4bit",
                       "lmdeploy/llama2-chat-70b-4bit", etc.
                     - iii) The model_id of a model hosted inside a model repo
-                      on huggingface.co, such as "InternLM/internlm-chat-7b",
+                      on huggingface.co, such as "internlm/internlm-chat-7b",
                       "Qwen/Qwen-7B-Chat ", "baichuan-inc/Baichuan2-7B-Chat"
                       and so on.
             model_name (str): needed when pretrained_model_name_or_path is c)
@@ -360,9 +410,11 @@ class TurboMind:
         if model_source == ModelSource.WORKSPACE:
             local_path = pretrained_model_name_or_path
         else:
-            check_tm_model_input(pretrained_model_name_or_path,
-                                 model_name=model_name,
-                                 **kwargs)
+            if model_name is None and (engine_config is None
+                                       or engine_config.model_name is None):
+                # huggingface repo id will be changed to local path in .cache
+                # have to match name in ahead.
+                model_name = best_match_model(pretrained_model_name_or_path)
             if not osp.exists(pretrained_model_name_or_path):
                 download_kwargs = create_hf_download_args(**kwargs)
                 local_path = snapshot_download(pretrained_model_name_or_path,
@@ -371,12 +423,14 @@ class TurboMind:
                 local_path = pretrained_model_name_or_path
 
         logger.warning(f'model_source: {model_source}')
-        return cls(model_source=model_source,
-                   model_path=local_path,
+        return cls(model_path=local_path,
+                   engine_config=engine_config,
+                   model_source=model_source,
                    model_name=model_name,
                    model_format=model_format,
                    group_size=group_size,
                    tp=tp,
+                   chat_template_config=chat_template_config,
                    **kwargs)
 
     def create_instance(self, cuda_stream_id=0):
@@ -406,8 +460,6 @@ class TurboMindInstance:
         self.gpu_count = tm_model.gpu_count
 
         self.stop_words = tm_model.stop_words
-        self.stop_tokens = [] if self.stop_words is None else \
-            self.stop_words.flatten().tolist()
         self.eos_id = tm_model.eos_id
         self.session_len = tm_model.session_len
 
@@ -456,23 +508,62 @@ class TurboMindInstance:
             t.start()
             self.threads[device_id] = t
 
+    def _update_generation_config(self, config: EngineGenerationConfig,
+                                  **kwargs: dict):
+        if config is None:
+            config = EngineGenerationConfig()
+        # backward compatibility
+        # if doesn't supply stop words, use default
+        if config.stop_words is None and self.stop_words is not None:
+            config.stop_words = self.stop_words[0][0].tolist()
+
+        deprecated_kwargs = []
+        for k, v in kwargs.items():
+            if k in config.__dict__:
+                config.__dict__[k] = v
+                deprecated_kwargs.append(k)
+        if kwargs.get('request_output_len'):
+            config.max_new_tokens = kwargs['request_output_len']
+            deprecated_kwargs.append('request_output_len')
+        for k in deprecated_kwargs:
+            get_logger('turbomind').warning(
+                f'kwargs {k} is deprecated for inference, '
+                'use GenerationConfig instead.')
+        return config
+
+    def end(self, session_id: int):
+        """End the given session."""
+        input_ids = [self.tm_model.tokenizer.eos_token_id]
+        end_generator = self.tm_model.create_instance()
+        for outputs in end_generator.stream_infer(session_id,
+                                                  input_ids,
+                                                  request_output_len=0,
+                                                  sequence_start=False,
+                                                  sequence_end=True):
+            pass
+
+    def cancel(self, session_id: int):
+        """Stop current streaming inference."""
+        input_ids = [self.tm_model.tokenizer.eos_token_id]
+        stop_generator = self.tm_model.create_instance()
+        for outputs in stop_generator.stream_infer(session_id,
+                                                   input_ids,
+                                                   request_output_len=0,
+                                                   sequence_start=False,
+                                                   sequence_end=False,
+                                                   stop=True):
+            pass
+
     def prepare_inputs(self,
                        session_id,
                        input_ids,
+                       gen_config: EngineGenerationConfig,
                        input_embeddings=None,
                        input_embedding_ranges=None,
-                       request_output_len: int = 512,
                        sequence_start: bool = True,
                        sequence_end: bool = False,
                        step=0,
-                       stop=False,
-                       top_p=0.8,
-                       top_k=40,
-                       temperature=0.8,
-                       repetition_penalty=1.0,
-                       ignore_eos=False,
-                       random_seed=None,
-                       stream_output=False):
+                       stop=False):
         """Convert inputs format."""
         if len(input_ids) == 0:
             input_ids = [[]]
@@ -504,19 +595,16 @@ class TurboMindInstance:
             input_ids=input_ids,
             input_lengths=input_lengths,
             request_output_len=np.full(input_lengths.shape,
-                                       request_output_len,
+                                       gen_config.max_new_tokens,
                                        dtype=np.uint32),
-            runtime_top_k=_broadcast_np(top_k, np.uint32),
-            runtime_top_p=_broadcast_np(top_p, np.float32),
-            temperature=_broadcast_np(temperature, np.float32),
-            repetition_penalty=_broadcast_np(repetition_penalty, np.float32),
+            runtime_top_k=_broadcast_np(gen_config.top_k, np.uint32),
+            runtime_top_p=_broadcast_np(gen_config.top_p, np.float32),
+            temperature=_broadcast_np(gen_config.temperature, np.float32),
+            repetition_penalty=_broadcast_np(gen_config.repetition_penalty,
+                                             np.float32),
             step=step,
 
             # session input
-            session_len=self.session_len *
-            np.ones([
-                batch_size,
-            ], dtype=np.uint32),
             START=_broadcast_np((1 if sequence_start else 0), np.int32),
             END=_broadcast_np((1 if sequence_end else 0), np.int32),
             CORRID=np.array(session_id, dtype=np.uint64),
@@ -560,20 +648,25 @@ class TurboMindInstance:
             inputs['input_embeddings'] = input_embeddings
             inputs['input_embedding_ranges'] = input_embedding_ranges
 
-        if ignore_eos:
+        bad_words = []
+        if gen_config.bad_words is not None:
+            bad_words.extend(gen_config.bad_words)
+        if gen_config.ignore_eos:
             stop_words = None
-            bad_words = torch.tensor([[[self.eos_id], [1]]], dtype=torch.int32)
+            bad_words.append(self.eos_id)
         else:
-            stop_words = self.stop_words
-            bad_words = None
+            stop_words = gen_config.stop_words
+        stop_words = _construct_stop_or_bad_words(stop_words)
+        bad_words = _construct_stop_or_bad_words(bad_words)
 
         if stop_words is not None:
             inputs['stop_words_list'] = stop_words
         if bad_words is not None:
             inputs['bad_words_list'] = bad_words
 
-        if random_seed is not None:
-            inputs['random_seed'] = _broadcast_np(random_seed, np.uint64)
+        if gen_config.random_seed is not None:
+            inputs['random_seed'] = _broadcast_np(gen_config.random_seed,
+                                                  np.uint64)
         return inputs, input_lengths
 
     async def async_stream_infer(self,
@@ -581,18 +674,13 @@ class TurboMindInstance:
                                  input_ids,
                                  input_embeddings=None,
                                  input_embedding_ranges=None,
-                                 request_output_len: int = 512,
                                  sequence_start: bool = True,
                                  sequence_end: bool = False,
                                  step=0,
                                  stop=False,
-                                 top_p=0.8,
-                                 top_k=40,
-                                 temperature=0.8,
-                                 repetition_penalty=1.0,
-                                 ignore_eos=False,
-                                 random_seed=None,
-                                 stream_output=False):
+                                 gen_config: EngineGenerationConfig = None,
+                                 stream_output=False,
+                                 **kwargs):
         """Perform model inference.
 
         Args:
@@ -601,42 +689,28 @@ class TurboMindInstance:
             input_embeddings (List[numpy.ndarray]): embeddings features
             input_embedding_ranges (List[Tuple[int,int]]): the begin/end
               offsets of input_embeddings to input_ids
-            request_output_len (int): the max number of to-be-generated tokens
             sequence_start (bool): indicator for starting a sequence
             sequence_end (bool): indicator for ending a sequence
             step (int): the offset of the k/v cache
             stop (bool): indicator for cancelling the session
-            top_p (float): If set to float < 1, only the smallest set of most
-              probable tokens with probabilities that add up to top_p or higher
-            are kept for generation.
-            top_k (int): The number of the highest probability vocabulary
-              tokens to keep for top-k-filtering
-            temperature (float): to modulate the next token probability
-            repetition_penalty (float): The parameter for repetition penalty.
-              1.0 means no penalty
-            ignore_eos (bool): indicator for ignoring eos
-            random_seed (int): seed used by sampling
+            gen_config (EngineGenerationConfig): generation config
             stream_output (bool): indicator for stream output
+            kwargs (dict): kwargs for backward compatibility
         """
         if stream_output and not stop:
             self.model_insts[0].register_callback(self._forward_callback)
+
+        gen_config = self._update_generation_config(gen_config, **kwargs)
         inputs, input_lengths = self.prepare_inputs(
             session_id=session_id,
             input_ids=input_ids,
             input_embeddings=input_embeddings,
             input_embedding_ranges=input_embedding_ranges,
-            request_output_len=request_output_len,
             sequence_start=sequence_start,
             sequence_end=sequence_end,
             step=step,
             stop=stop,
-            top_p=top_p,
-            top_k=top_k,
-            temperature=temperature,
-            repetition_penalty=repetition_penalty,
-            ignore_eos=ignore_eos,
-            random_seed=random_seed,
-            stream_output=stream_output)
+            gen_config=gen_config)
 
         tm_inputs = _np_dict_to_tm_dict(inputs)
         # start forward thread
@@ -650,7 +724,8 @@ class TurboMindInstance:
             # Thanks for https://github.com/frankxyy and his issue
             # https://github.com/InternLM/lmdeploy/issues/832
             while self.que.qsize() == 0:
-                await asyncio.sleep(0)
+                await asyncio.sleep(0.002)  # sleep(0) makes server unstable
+
             while self.que.qsize() > 1:
                 self.que.get()
 
@@ -667,15 +742,18 @@ class TurboMindInstance:
             sequence_length -= seq_start.to(sequence_length.device)
 
             outputs = []
+            status = ResponseType.FINISH if finish else ResponseType.SUCCESS
             for output, len_ in zip(output_ids, sequence_length):
                 output, len_ = output, len_.item()
-                if len(output) > 0 and output[-1].item(
-                ) == self.eos_id and not ignore_eos:
-                    outputs.append((output[:-1], len_ - 1))
-                elif len(output) > 0 and output[-1].item() in self.stop_tokens:
-                    outputs.append((output[:-1], len_))
+                if len(output) > 0 and output[-1].item() == self.eos_id \
+                        and not gen_config.ignore_eos:
+                    outputs = (status, output[:-1].tolist(), len_ - 1)
+                elif len(output) > 0 and \
+                    gen_config.stop_words is not None and \
+                        output[-1].item() in gen_config.stop_words:
+                    outputs = (status, output[:-1].tolist(), len_)
                 else:
-                    outputs.append((output, len_))
+                    outputs = (status, output.tolist(), len_)
             yield outputs
 
             if finish:
@@ -693,18 +771,13 @@ class TurboMindInstance:
                      input_ids,
                      input_embeddings=None,
                      input_embedding_ranges=None,
-                     request_output_len: int = 512,
                      sequence_start: bool = True,
                      sequence_end: bool = False,
                      step=0,
                      stop=False,
-                     top_p=0.8,
-                     top_k=40,
-                     temperature=0.8,
-                     repetition_penalty=1.0,
-                     ignore_eos=False,
-                     random_seed=None,
-                     stream_output=False):
+                     gen_config: EngineGenerationConfig = None,
+                     stream_output=False,
+                     **kwargs):
         """Perform model inference.
 
         Args:
@@ -713,42 +786,28 @@ class TurboMindInstance:
             input_embeddings (List[numpy.ndarray]): embeddings features
             input_embedding_ranges (List[Tuple[int,int]]): the begin/end
               offsets of input_embeddings to input_ids
-            request_output_len (int): the max number of to-be-generated tokens
             sequence_start (bool): indicator for starting a sequence
             sequence_end (bool): indicator for ending a sequence
             step (int): the offset of the k/v cache
             stop (bool): indicator for cancelling the session
-            top_p (float): If set to float < 1, only the smallest set of most
-              probable tokens with probabilities that add up to top_p or higher
-            are kept for generation.
-            top_k (int): The number of the highest probability vocabulary
-              tokens to keep for top-k-filtering
-            temperature (float): to modulate the next token probability
-            repetition_penalty (float): The parameter for repetition penalty.
-              1.0 means no penalty
-            ignore_eos (bool): indicator for ignoring eos
-            random_seed (int): seed used by sampling
+            gen_config (EngineGenerationConfig): generation config
             stream_output (bool): indicator for stream output
+            kwargs (dict): kwargs for backward compatibility
         """
         if stream_output and not stop:
             self.model_insts[0].register_callback(self._forward_callback)
+
+        gen_config = self._update_generation_config(gen_config, **kwargs)
         inputs, input_lengths = self.prepare_inputs(
             session_id=session_id,
             input_ids=input_ids,
             input_embeddings=input_embeddings,
             input_embedding_ranges=input_embedding_ranges,
-            request_output_len=request_output_len,
             sequence_start=sequence_start,
             sequence_end=sequence_end,
             step=step,
             stop=stop,
-            top_p=top_p,
-            top_k=top_k,
-            temperature=temperature,
-            repetition_penalty=repetition_penalty,
-            ignore_eos=ignore_eos,
-            random_seed=random_seed,
-            stream_output=stream_output)
+            gen_config=gen_config)
 
         tm_inputs = _np_dict_to_tm_dict(inputs)
         # start forward thread
@@ -775,15 +834,18 @@ class TurboMindInstance:
             sequence_length -= seq_start.to(sequence_length.device)
 
             outputs = []
+            status = ResponseType.FINISH if finish else ResponseType.SUCCESS
             for output, len_ in zip(output_ids, sequence_length):
                 output, len_ = output, len_.item()
-                if len(output) > 0 and output[-1].item(
-                ) == self.eos_id and not ignore_eos:
-                    outputs.append((output[:-1], len_ - 1))
-                elif len(output) > 0 and output[-1].item() in self.stop_tokens:
-                    outputs.append((output[:-1], len_))
+                if len(output) > 0 and output[-1].item() == self.eos_id \
+                        and not gen_config.ignore_eos:
+                    outputs = (status, output[:-1].tolist(), len_ - 1)
+                elif len(output) > 0 and \
+                    gen_config.stop_words is not None and \
+                        output[-1].item() in gen_config.stop_words:
+                    outputs = (status, output[:-1].tolist(), len_)
                 else:
-                    outputs.append((output, len_))
+                    outputs = (status, output.tolist(), len_)
             yield outputs
 
             if finish:
@@ -796,17 +858,27 @@ class TurboMindInstance:
         if stream_output and not stop:
             self.model_insts[0].unregister_callback()
 
-    def decode(self, input_ids):
+    def decode(self,
+               input_ids,
+               steps: List[int] = None,
+               sequence_start: bool = True,
+               sequence_end: bool = True):
         """Perform context decode on input tokens.
 
         Args:
             input_ids (numpy.ndarray): the batch of input token ids
+            steps (List[int]): the offset of the k/v cache
+            sequence_start (bool): indicator for starting a sequence
+            sequence_end (bool): indicator for ending a sequence
         """
 
         if len(input_ids) == 0:
             input_ids = [[]]
         if isinstance(input_ids[0], int):
             input_ids = [input_ids]
+        if steps is None:
+            steps = [0] * len(input_ids)
+        assert isinstance(steps, List) and len(steps) == len(input_ids)
 
         # append an extra token since input_len-1 tokens will be
         # decoded by context decoder
@@ -827,11 +899,16 @@ class TurboMindInstance:
         input_ids = pad_sequence(input_ids,
                                  batch_first=True,
                                  padding_value=self.eos_id)
+        steps = torch.IntTensor([step for step in steps])
 
         inputs = dict(input_ids=input_ids,
                       input_lengths=input_lengths,
                       request_output_len=_broadcast_np(0, dtype=np.uint32),
-                      is_return_logits=_broadcast_np(1, np.uint32))
+                      is_return_logits=_broadcast_np(1, np.uint32),
+                      START=_broadcast_np((1 if sequence_start else 0),
+                                          np.int32),
+                      END=_broadcast_np((1 if sequence_end else 0), np.int32),
+                      step=steps)
 
         tm_inputs = _np_dict_to_tm_dict(inputs)
 
@@ -844,3 +921,83 @@ class TurboMindInstance:
         logits = outputs['logits']
 
         return logits[:, :-1, :]
+
+    def get_ppl(self, input_ids: Union[List[int], List[List[int]]]):
+        """Get perplexity scores given a list of input tokens.
+
+        Args:
+            input_ids (Union[List[int], List[List[int]]]): the batch of input token ids
+        """  # noqa 501
+
+        if len(input_ids) == 0:
+            input_ids = [[]]
+        if isinstance(input_ids[0], int):
+            input_ids = [input_ids]
+
+        max_input_len = 16 * 1024
+        # max_input_len = 16
+        n_max_iter = np.ceil(
+            max([len(input_id)
+                 for input_id in input_ids]) / max_input_len).astype(int)
+
+        device = 'cpu' if n_max_iter > 0 else 'cuda'
+
+        index_range_starts = []
+        index_range_ends = []
+        for input_id in input_ids:
+            index_range_start = np.array(
+                [i * max_input_len for i in range(n_max_iter)])
+            index_range_end = index_range_start + max_input_len
+            index_range_start[index_range_start >= len(input_id)] = len(
+                input_id)
+            index_range_end[index_range_end >= len(input_id)] = len(input_id)
+            index_range_starts.append(index_range_start)
+            index_range_ends.append(index_range_end)
+
+        logits = []
+        for i in range(n_max_iter):
+            steps = [start[i] for start in index_range_starts]
+            _input_ids = [
+                input_id[start[i]:end[i]] for input_id, start, end in zip(
+                    input_ids, index_range_starts, index_range_ends)
+            ]
+            _logits = self.decode(_input_ids,
+                                  steps,
+                                  sequence_start=(i == 0),
+                                  sequence_end=(i == n_max_iter - 1))
+            _logits = _logits.to(device=device)
+            logits.append(_logits)
+
+        # concat logits. Shape is [bsz, seq_len, vocab_size]
+        logits = torch.cat(logits, dim=1)
+
+        # get target ids
+        padding_token_id = -100
+        target_ids = [(_input_ids + [padding_token_id])[1:]
+                      for _input_ids in input_ids]
+        target_ids = [
+            torch.Tensor(torch.LongTensor(_target_ids))
+            for _target_ids in target_ids
+        ]
+        target_ids = pad_sequence(target_ids,
+                                  batch_first=True,
+                                  padding_value=padding_token_id)
+        target_ids = target_ids.to(logits.device)
+        target_mask = target_ids != padding_token_id
+        target_count = torch.sum(target_mask, dim=-1)
+
+        # compute cross entropy loss
+        bsz, seq_len, vocab_size = logits.shape
+        flat_logits = logits.contiguous().view(-1, vocab_size)
+        flat_target_ids = target_ids.contiguous().view(-1)
+        flat_loss_matrix = torch.nn.functional.cross_entropy(
+            flat_logits,
+            flat_target_ids,
+            reduction='none',
+            ignore_index=padding_token_id)
+
+        loss_matrix = flat_loss_matrix.view(bsz, seq_len)
+        loss_sum = torch.sum(loss_matrix * target_mask, dim=1)
+        loss_avg = loss_sum / target_count
+        loss_avg = loss_avg.cpu().numpy()
+        return loss_avg

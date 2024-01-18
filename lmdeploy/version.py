@@ -1,7 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from typing import Tuple
 
-__version__ = '0.1.0'
+__version__ = '0.2.0'
 short_version = __version__
 
 
@@ -26,5 +26,3 @@ def parse_version_info(version_str: str) -> Tuple:
 
 
 version_info = parse_version_info(__version__)
-
-__all__ = ['__version__', 'version_info', 'parse_version_info']

@@ -1,9 +1,13 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+import random
 from threading import Lock
-from typing import Optional, Sequence
+from typing import Literal, Optional, Sequence, Union
 
 import gradio as gr
 
+from lmdeploy.messages import (GenerationConfig, PytorchEngineConfig,
+                               TurbomindEngineConfig)
+from lmdeploy.model import ChatTemplateConfig
 from lmdeploy.serve.async_engine import AsyncEngine
 from lmdeploy.serve.gradio.constants import CSS, THEME, disable_btn, enable_btn
 
@@ -14,13 +18,10 @@ class InterFace:
     lock = Lock()
 
 
-async def chat_stream_local(
-    instruction: str,
-    state_chatbot: Sequence,
-    cancel_btn: gr.Button,
-    reset_btn: gr.Button,
-    session_id: int,
-):
+async def chat_stream_local(instruction: str, state_chatbot: Sequence,
+                            cancel_btn: gr.Button, reset_btn: gr.Button,
+                            session_id: int, top_p: float, temperature: float,
+                            request_output_len: int):
     """Chat with AI assistant.
 
     Args:
@@ -33,10 +34,17 @@ async def chat_stream_local(
     state_chatbot = state_chatbot + [(instruction, None)]
 
     yield (state_chatbot, state_chatbot, disable_btn, enable_btn)
+    gen_config = GenerationConfig(max_new_tokens=request_output_len,
+                                  top_p=top_p,
+                                  top_k=40,
+                                  temperature=temperature,
+                                  random_seed=random.getrandbits(64)
+                                  if len(state_chatbot) == 1 else None)
 
     async for outputs in InterFace.async_engine.generate(
             instruction,
             session_id,
+            gen_config=gen_config,
             stream_response=True,
             sequence_start=(len(state_chatbot) == 1),
             sequence_end=False):
@@ -86,27 +94,35 @@ async def cancel_local_func(state_chatbot: Sequence, cancel_btn: gr.Button,
     """
     yield (state_chatbot, disable_btn, disable_btn)
     InterFace.async_engine.stop_session(session_id)
-    InterFace.async_engine.end_session(session_id)
-    messages = []
-    for qa in state_chatbot:
-        messages.append(dict(role='user', content=qa[0]))
-        if qa[1] is not None:
-            messages.append(dict(role='assistant', content=qa[1]))
-    async for out in InterFace.async_engine.generate(messages,
-                                                     session_id,
-                                                     request_output_len=0,
-                                                     stream_response=True,
-                                                     sequence_start=True,
-                                                     sequence_end=False):
-        pass
-    yield (state_chatbot, disable_btn, enable_btn)
+    # pytorch backend does not support resume chat history now
+    if InterFace.async_engine.backend == 'pytorch':
+        yield (state_chatbot, disable_btn, enable_btn)
+    else:
+        InterFace.async_engine.end_session(session_id)
+        messages = []
+        for qa in state_chatbot:
+            messages.append(dict(role='user', content=qa[0]))
+            if qa[1] is not None:
+                messages.append(dict(role='assistant', content=qa[1]))
+        gen_config = GenerationConfig(max_new_tokens=0)
+        async for out in InterFace.async_engine.generate(messages,
+                                                         session_id,
+                                                         gen_config=gen_config,
+                                                         stream_response=True,
+                                                         sequence_start=True,
+                                                         sequence_end=False):
+            pass
+        yield (state_chatbot, disable_btn, enable_btn)
 
 
 def run_local(model_path: str,
               model_name: Optional[str] = None,
+              backend: Literal['turbomind', 'pytorch'] = 'turbomind',
+              backend_config: Optional[Union[PytorchEngineConfig,
+                                             TurbomindEngineConfig]] = None,
+              chat_template_config: Optional[ChatTemplateConfig] = None,
               server_name: str = 'localhost',
               server_port: int = 6006,
-              batch_size: int = 4,
               tp: int = 1,
               **kwargs):
     """chat with AI assistant through web ui.
@@ -122,22 +138,30 @@ def run_local(model_path: str,
                     "InternLM/internlm-chat-20b-4bit",
                     "lmdeploy/llama2-chat-70b-4bit", etc.
                 - iii) The model_id of a model hosted inside a model repo
-                    on huggingface.co, such as "InternLM/internlm-chat-7b",
+                    on huggingface.co, such as "internlm/internlm-chat-7b",
                     "Qwen/Qwen-7B-Chat ", "baichuan-inc/Baichuan2-7B-Chat"
                     and so on.
         model_name (str): needed when model_path is a pytorch model on
-            huggingface.co, such as "InternLM/internlm-chat-7b",
+            huggingface.co, such as "internlm/internlm-chat-7b",
             "Qwen/Qwen-7B-Chat ", "baichuan-inc/Baichuan2-7B-Chat" and so on.
+        backend (str): either `turbomind` or `pytorch` backend. Default to
+            `turbomind` backend.
+        backend_config (TurbomindEngineConfig | PytorchEngineConfig): beckend
+            config instance. Default to none.
+        chat_template_config (ChatTemplateConfig): chat template configuration.
+            Default to None.
         server_name (str): the ip address of gradio server
         server_port (int): the port of gradio server
-        batch_size (int): batch size for running Turbomind directly
         tp (int): tensor parallel for Turbomind
     """
-    InterFace.async_engine = AsyncEngine(model_path=model_path,
-                                         model_name=model_name,
-                                         instance_num=batch_size,
-                                         tp=tp,
-                                         **kwargs)
+    InterFace.async_engine = AsyncEngine(
+        model_path=model_path,
+        backend=backend,
+        backend_config=backend_config,
+        chat_template_config=chat_template_config,
+        model_name=model_name,
+        tp=tp,
+        **kwargs)
 
     with gr.Blocks(css=CSS, theme=THEME) as demo:
         state_chatbot = gr.State([])
@@ -148,17 +172,29 @@ def run_local(model_path: str,
 
             chatbot = gr.Chatbot(
                 elem_id='chatbot',
-                label=InterFace.async_engine.tm_model.model_name)
+                label=InterFace.async_engine.engine.model_name)
             instruction_txtbox = gr.Textbox(
                 placeholder='Please input the instruction',
                 label='Instruction')
             with gr.Row():
                 cancel_btn = gr.Button(value='Cancel', interactive=False)
                 reset_btn = gr.Button(value='Reset')
+            with gr.Row():
+                request_output_len = gr.Slider(1,
+                                               2048,
+                                               value=512,
+                                               step=1,
+                                               label='Maximum new tokens')
+                top_p = gr.Slider(0.01, 1, value=0.8, step=0.01, label='Top_p')
+                temperature = gr.Slider(0.01,
+                                        1.5,
+                                        value=0.7,
+                                        step=0.01,
+                                        label='Temperature')
 
         send_event = instruction_txtbox.submit(chat_stream_local, [
             instruction_txtbox, state_chatbot, cancel_btn, reset_btn,
-            state_session_id
+            state_session_id, top_p, temperature, request_output_len
         ], [state_chatbot, chatbot, cancel_btn, reset_btn])
         instruction_txtbox.submit(
             lambda: gr.Textbox.update(value=''),
@@ -185,7 +221,8 @@ def run_local(model_path: str,
         demo.load(init, inputs=None, outputs=[state_session_id])
 
     print(f'server is gonna mount on: http://{server_name}:{server_port}')
-    demo.queue(concurrency_count=batch_size, max_size=100,
+    demo.queue(concurrency_count=InterFace.async_engine.instance_num,
+               max_size=100,
                api_open=True).launch(
                    max_threads=10,
                    share=True,

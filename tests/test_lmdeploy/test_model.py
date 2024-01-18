@@ -1,6 +1,46 @@
 import pytest
 
-from lmdeploy.model import MODELS, SamplingParam
+from lmdeploy.model import MODELS, SamplingParam, best_match_model
+
+
+@pytest.mark.parametrize(
+    'model_path_and_name',
+    [('internlm/internlm-chat-7b', ['internlm-chat-7b']),
+     ('Qwen/Qwen-7B-Chat', ['qwen-7b']),
+     ('baichuan-inc/Baichuan-7B', ['baichuan-7b']),
+     ('codellama/CodeLlama-7b-hf', ['codellama']),
+     ('upstage/SOLAR-0-70b', ['solar', 'solar-70b']),
+     ('meta-llama/Llama-2-7b-chat-hf', ['llama-2-chat', 'llama-2']),
+     ('THUDM/chatglm2-6b', ['chatglm2-6b']),
+     ('01-ai/Yi-6B-200k', ['yi', 'yi-200k']),
+     ('01-ai/Yi-34B-Chat', ['yi-chat', 'yi-34b', 'yi-200k']),
+     ('01-ai/Yi-6B-Chat', ['yi', 'yi-chat']),
+     ('WizardLM/WizardLM-70B-V1.0', ['wizardlm']),
+     ('CodeLlama-34b-Instruct-hf', ['codellama']),
+     ('tiiuae/falcon-7b', ['falcon']), ('workspace', [None])])
+@pytest.mark.parametrize('suffix', ['', '-w4', '-4bit', '-16bit'])
+def test_best_match_model(model_path_and_name, suffix):
+    deduced_name = best_match_model(model_path_and_name[0] + suffix)
+    if deduced_name is not None:
+        assert deduced_name in model_path_and_name[
+            1], f'expect {model_path_and_name[1]}, but got {deduced_name}'
+    else:
+        assert deduced_name in model_path_and_name[
+            1], f'expect {model_path_and_name[1]}, but got {deduced_name}'
+
+
+@pytest.mark.parametrize('model_name',
+                         ['llama2', 'base', 'yi', 'qwen-7b', 'vicuna'])
+@pytest.mark.parametrize('meta_instruction', ['[fake meta_instruction]'])
+def test_model_config(model_name, meta_instruction):
+    from lmdeploy.model import ChatTemplateConfig
+    chat_template = ChatTemplateConfig(
+        model_name, meta_instruction=meta_instruction).chat_template
+    prompt = chat_template.get_prompt('')
+    if model_name == 'base':
+        assert prompt == ''
+    else:
+        assert meta_instruction in prompt
 
 
 def test_base_model():
@@ -43,7 +83,7 @@ def test_internlm_chat():
     assert model.get_prompt(prompt, sequence_start=True) == prompt
     assert model.get_prompt(prompt, sequence_start=False) == prompt
     assert model.stop_words is not None
-    assert model.system == ''
+    assert model.system == '<|System|>:'
     assert model.session_len == 2048
 
     model = MODELS.get('internlm-chat-7b')(capability='chat',

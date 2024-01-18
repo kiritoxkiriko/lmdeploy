@@ -12,7 +12,7 @@ wget https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/r
 ```
 
 During performance test, a specific model needs to be inputted. We recommend converting the model into turbomind format via `lmdeploy convert`, then proceed with testing.
-The reason is to conveniently adjust the parameters of the inference engine in order to achieve better performance, such as batch size (max_batch_size), K/V cache size (max_cache_entry_count), etc. For detailed explanations of these parameters, please refer to [here](../turbomind_config.md).
+The reason is to conveniently adjust the parameters of the inference engine in order to achieve better performance, such as batch size (max_batch_size), K/V cache size (max_cache_entry_count), etc. For detailed explanations of these parameters, please refer to [here](../inference/turbomind_config.md).
 
 In the following sections, we assume the model is in turbomind format.
 
@@ -53,7 +53,7 @@ lmdeploy convert internlm internlm/internlm-7b --dst-path ./internlm-7b
 bash ./internlm-7b/service_docker_up.sh
 
 # open another terminal and run the following command in the directory `lmdeploy/benchmark`
-python3 ./profile_serving 0.0.0.0:33337 ./internlm-7b/triton_models/tokenizer ./ShareGPT_V3_unfiltered_cleaned_split.json
+python3 ./profile_serving.py 0.0.0.0:33337 ./internlm-7b/triton_models/tokenizer ./ShareGPT_V3_unfiltered_cleaned_split.json
 ```
 
 ## Command details
