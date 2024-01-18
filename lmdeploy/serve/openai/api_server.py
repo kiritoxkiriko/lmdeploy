@@ -32,12 +32,12 @@ _logger = logging.getLogger('uvicorn.error')
 
 
 # body logger
-def body_logger(request, raw_request: Request, start_time: float):
+def body_logger(request, raw_request: Request, start_time: float, resp=None):
     request_body = request.model_dump_json()
     process_time = time.time() - start_time
     request_id = raw_request.headers.get('X-NADP-RequestID')
     _logger.info(
-        f'receive request: id: {request_id}, body: {request_body}, time: {process_time}')
+        f'receive request: id: {request_id}, body: {request_body}, resp: {resp}, time: {process_time}')
 
 
 if not 'TM_LOG_LEVEL' in os.environ or os.environ['TM_LOG_LEVEL'] == '':
@@ -299,6 +299,7 @@ async def chat_completions_v1(request: ChatCompletionRequest,
     - presence_penalty (replaced with repetition_penalty)
     - frequency_penalty (replaced with repetition_penalty)
     """
+    start_time = time.time()
     if request.session_id == -1:
         request.session_id = random.randint(1, 10086)
     error_check_ret = await check_request(request)
@@ -376,9 +377,11 @@ async def chat_completions_v1(request: ChatCompletionRequest,
 
     # Streaming response
     if request.stream:
-        body_logger(request, raw_request, start_time)
-        return StreamingResponse(completion_stream_generator(),
+
+        response = StreamingResponse(completion_stream_generator(),
                                  media_type='text/event-stream')
+        body_logger(request, raw_request, start_time, resp=response)
+        return response
 
     # Non-streaming response
     final_res = None
@@ -416,7 +419,7 @@ async def chat_completions_v1(request: ChatCompletionRequest,
         choices=choices,
         usage=usage,
     )
-    body_logger(request, raw_request, start_time)
+    body_logger(request, raw_request, start_time, resp=response)
 
     return response
 
