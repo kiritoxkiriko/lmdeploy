@@ -78,12 +78,14 @@ class ChatCompletionRequestQos(BaseModel):
 class ChatCompletionRequest(BaseModel):
     """Chat completion request."""
     model: str
-    messages: Union[str, List[Dict[str, str]]]
+    # yapf: disable
+    messages: Union[str, List[Dict[str, str]]] = Field(examples=[[{'role': 'user', 'content': 'hi'}]])  # noqa
     temperature: Optional[float] = 0.7
     top_p: Optional[float] = 1.0
     n: Optional[int] = 1
     max_tokens: Optional[int] = 512
-    stop: Optional[Union[str, List[str]]] = None
+    stop: Optional[Union[str, List[str]]] = Field(default=None, examples=[None])  # noqa
+    # yapf: enable
     stream: Optional[bool] = False
     presence_penalty: Optional[float] = 0.0
     frequency_penalty: Optional[float] = 0.0
@@ -92,6 +94,7 @@ class ChatCompletionRequest(BaseModel):
     repetition_penalty: Optional[float] = 1.0
     session_id: Optional[int] = -1
     ignore_eos: Optional[bool] = False
+    skip_special_tokens: Optional[bool] = True
 
 
 class ChatMessage(BaseModel):
@@ -147,7 +150,8 @@ class CompletionRequest(BaseModel):
     temperature: Optional[float] = 0.7
     n: Optional[int] = 1
     max_tokens: Optional[int] = 16
-    stop: Optional[Union[str, List[str]]] = None
+    stop: Optional[Union[str, List[str]]] = Field(default=None,
+                                                  examples=[None])
     stream: Optional[bool] = False
     top_p: Optional[float] = 1.0
     logprobs: Optional[int] = None
@@ -159,6 +163,7 @@ class CompletionRequest(BaseModel):
     repetition_penalty: Optional[float] = 1.0
     session_id: Optional[int] = -1
     ignore_eos: Optional[bool] = False
+    skip_special_tokens: Optional[bool] = True
     top_k: Optional[int] = 40  # for opencompass
 
 
@@ -255,13 +260,15 @@ class GenerateRequest(BaseModel):
     session_id: int = -1
     interactive_mode: bool = False
     stream: bool = False
-    stop: Optional[Union[str, List[str]]] = None
+    stop: Optional[Union[str, List[str]]] = Field(default=None,
+                                                  examples=[None])
     request_output_len: int = 512
     top_p: float = 0.8
     top_k: int = 40
     temperature: float = 0.8
     repetition_penalty: float = 1.0
     ignore_eos: bool = False
+    skip_special_tokens: Optional[bool] = True
     cancel: Optional[bool] = False  # cancel a responding request
 
 

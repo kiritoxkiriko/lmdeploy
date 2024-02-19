@@ -1,5 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-import asyncio
+import os
 import time
 from dataclasses import dataclass
 from queue import Queue
@@ -11,7 +11,7 @@ import torch
 from lmdeploy.messages import (EngineGenerationConfig, PytorchEngineConfig,
                                ResponseType)
 from lmdeploy.tokenizer import Tokenizer
-from lmdeploy.utils import get_logger
+from lmdeploy.utils import get_logger, get_model
 
 from ..adapter.adapter import ADAPTER_MANAGER, SchedulerAdapter
 from ..config import CacheConfig, SchedulerConfig
@@ -43,7 +43,9 @@ class InferOutput:
 
 def _check_resp(resp: Response, state: ResponseType, warning_msg: str = None):
     """check if response has state."""
-    ret = resp.type == state
+    if isinstance(state, ResponseType):
+        state = [state]
+    ret = resp.type in state
     if not ret and warning_msg is not None:
         logger.warning(warning_msg)
     return ret
@@ -112,6 +114,10 @@ class Engine:
                                    num_cpu_blocks=engine_config.num_cpu_blocks,
                                    num_gpu_blocks=engine_config.num_gpu_blocks)
 
+        if not os.path.exists(model_path):
+            model_path = get_model(model_path, engine_config.download_dir,
+                                   engine_config.revision)
+
         self.model_agent = AutoModelAgent.from_pretrained(
             model_path,
             cache_config=cache_config,
@@ -132,7 +138,6 @@ class Engine:
         self.stream = torch.cuda.Stream()
 
         self.req_manager = self._bind_request_manager()
-        self.owned_sessions = []
 
         # create main thread
         self.loop_threads = self._start_loop()
@@ -240,6 +245,13 @@ class Engine:
 
     def _on_add_message(self, reqs: Request, **kwargs):
         """on add message callback."""
+
+        def __update_bad_words(msg):
+            """update bad words."""
+            sampling_param = msg.sampling_param
+            if sampling_param.ignore_eos:
+                sampling_param.bad_words.append(self.model_config.eos_token_id)
+
         for req in reqs:
             session_id = req.data['session_id']
             if session_id not in self.scheduler.sessions:
@@ -260,6 +272,7 @@ class Engine:
                     sampling_param=req.data['sampling_param'],
                     adapter_name=req.data['adapter_name'])
                 msg = next(iter(sess.sequences.values()))
+                __update_bad_words(msg)
                 self.scheduler.add_sequence(msg)
             else:
                 msg = next(iter(sess.sequences.values()))
@@ -267,6 +280,7 @@ class Engine:
                 msg.remain_output_len = req.data['max_request_output_len']
                 msg.sampling_param = req.data['sampling_param']
                 msg.status = MessageStatus.WAITING
+                __update_bad_words(msg)
 
             msg.sender_id = req.sender_id
             msg.req_id = req.req_id
@@ -297,18 +311,14 @@ class Engine:
 
     def add_session(self, session_id: int):
         """Add new session."""
-        if session_id not in self.owned_sessions:
-            resp = self.req_sender.send(RequestType.ADD_SESSION,
-                                        dict(session_id=session_id))
-            if _check_resp_success(resp, (f'Can not add session {session_id} '
-                                          f'with error: {resp.type}')):
-                self.owned_sessions.append(session_id)
+        resp = self.req_sender.send(RequestType.ADD_SESSION,
+                                    dict(session_id=session_id))
+        _check_resp(resp, [ResponseType.SUCCESS, ResponseType.SESSION_REPEAT],
+                    (f'Can not add session {session_id} '
+                     f'with error: {resp.type}'))
 
     def stop_session(self, session_id: int):
         """Stop the given session."""
-        if session_id not in self.owned_sessions:
-            logger.warning(f'session {session_id} is not owned '
-                           'by this instance')
         resp = self.req_sender.send(RequestType.STOP_SESSION,
                                     dict(session_id=session_id))
         _check_resp_success(resp, (f'Failed to cancel session: {session_id}. '
@@ -316,14 +326,10 @@ class Engine:
 
     def end_session(self, session_id: int):
         """End the given session."""
-        if session_id not in self.owned_sessions:
-            logger.warning(f'session {session_id} is not owned '
-                           'by this instance')
         resp = self.req_sender.send(RequestType.END_SESSION,
                                     dict(session_id=session_id))
-        if _check_resp_success(resp, (f'Failed to end session: {session_id}. '
-                                      f'Error: {resp.type}.')):
-            self.owned_sessions.remove(session_id)
+        _check_resp_success(resp, (f'Failed to end session: {session_id}. '
+                                   f'Error: {resp.type}.'))
 
     @torch.inference_mode()
     def create_model_inputs(self, messages: SeqList, adapters: AdapterList):
@@ -399,7 +405,7 @@ class Engine:
                            max_rank=max_rank,
                            meta=meta)
 
-    def _stoping_criteria(self, msg: SchedulerSequence, next_token_id: int):
+    def _stopping_criteria(self, msg: SchedulerSequence, next_token_id: int):
         """Check if the message should stop.
 
         Args:
@@ -411,9 +417,8 @@ class Engine:
         """
 
         # check eof
-        def _check_eof(sampling_param, next_token_id, eos_token_id):
-            return (not sampling_param.ignore_eos
-                    ) and next_token_id == eos_token_id
+        def _check_eof(next_token_id, eos_token_id):
+            return next_token_id == eos_token_id
 
         def _check_stop_word(sampling_param, next_token_id):
             return (sampling_param.stop_words is not None
@@ -429,8 +434,7 @@ class Engine:
             return session_len >= max_session_len
 
         sampling_param = msg.sampling_param
-        if _check_eof(sampling_param, next_token_id,
-                      self.model_config.eos_token_id):
+        if _check_eof(next_token_id, self.model_config.eos_token_id):
             return True
         if _check_stop_word(sampling_param, next_token_id):
             return True
@@ -489,8 +493,23 @@ class Engine:
             msg.meta = meta
             msg.update_token_ids(token)
             msg.remain_output_len -= 1
-            if self._stoping_criteria(msg, token):
+            if msg.remain_output_len < 0:
+                msg.token_ids = torch.empty((0, ), dtype=torch.long)
+            if self._stopping_criteria(msg, token):
                 msg.status = MessageStatus.STOPPED
+
+    def _can_output_token(self, token: torch.Tensor, msg: SchedulerSequence):
+        """check if output is necessary."""
+        if isinstance(token, torch.Tensor):
+            token = token.item()
+        if token == self.model_config.eos_token_id:
+            return False
+
+        stop_words = msg.sampling_param.stop_words
+        if stop_words is not None and token in stop_words:
+            return False
+
+        return True
 
     def _model_forward(self, inputs: ModelInputs, swap_in_map: Dict,
                        swap_out_map: Dict):
@@ -638,12 +657,16 @@ class Engine:
         outputs: Dict[int, InferOutput] = dict()
         for msg, next_id in zip(running, next_token_ids):
             session_id = msg.session_id
+            if self._can_output_token(next_id, msg):
+                out_token_ids = [next_id.item()]
+            else:
+                out_token_ids = []
             out = InferOutput(
                 session_id=session_id,
                 sender_id=msg.sender_id,
                 req_id=msg.req_id,
                 finish=(msg.status == MessageStatus.STOPPED),
-                token_ids=[next_id.item()],
+                token_ids=out_token_ids,
             )
             outputs[session_id] = out
 
@@ -681,10 +704,9 @@ class Engine:
         else:
             adapter_names = [None for _ in range(batch_size)]
 
-        def _add_sessions(session_ids, owned_sessions):
+        def _add_sessions(session_ids):
             for session_id in session_ids:
-                if session_id not in owned_sessions:
-                    self.add_session(session_id)
+                self.add_session(session_id)
 
         def _add_messages(session_ids, token_ids):
             add_msgs = []
@@ -703,7 +725,7 @@ class Engine:
                                                          data=add_msgs)
             return req_ids
 
-        _add_sessions(session_ids, self.owned_sessions)
+        _add_sessions(session_ids)
         req_ids = _add_messages(session_ids, token_ids)
 
         # receive messages
@@ -792,6 +814,7 @@ class Engine:
             """send response callback."""
             while True:
                 step_tokens = send_resp_que.get()
+                time.sleep(0.02)
                 for _, out in step_tokens.items():
                     if out.finish:
                         resp_type = ResponseType.FINISH
@@ -843,13 +866,9 @@ class EngineInstance:
     def __init__(self, engine: Engine):
         self.engine = engine
         self.req_sender = engine.req_manager.build_sender(engine.loop_threads)
-        self.owned_sessions: List[int] = list()
 
     def __del__(self):
         """Destructor."""
-        if self.req_sender.is_thread_alive():
-            for session_id in self.owned_sessions:
-                self.end(session_id)
         self.engine.req_manager.senders.pop(self.req_sender.sender_id)
 
     def _try_add_session(self, session_id: int):
@@ -858,17 +877,17 @@ class EngineInstance:
         Args:
             session_id (int): The session id to add.
         """
-        if session_id not in self.owned_sessions:
-            resp = self.req_sender.send(RequestType.ADD_SESSION,
-                                        dict(session_id=session_id))
-            if _check_resp_success(resp, (f'Can not add session {session_id} '
-                                          f'with error: {resp.type}')):
-                self.owned_sessions.append(session_id)
+        resp = self.req_sender.send(RequestType.ADD_SESSION,
+                                    dict(session_id=session_id))
+        _check_resp(resp, [ResponseType.SUCCESS, ResponseType.SESSION_REPEAT],
+                    (f'Can not add session {session_id} '
+                     f'with error: {resp.type}'))
 
     async def async_stream_infer(self,
                                  session_id: int,
                                  input_ids: List[int],
                                  gen_config: EngineGenerationConfig = None,
+                                 adapter_name: str = None,
                                  **kwargs):
         """Send stream inference request.
 
@@ -883,12 +902,38 @@ class EngineInstance:
             List[int]: The streaming output tokens.
             int: The number of the output tokens.
         """
-        for item in self.stream_infer(session_id=session_id,
-                                      input_ids=input_ids,
-                                      gen_config=gen_config,
-                                      **kwargs):
-            await asyncio.sleep(0)
-            yield item
+        gen_config = gen_config or EngineGenerationConfig()
+        request_output_len = gen_config.max_new_tokens
+        sampling_param = SamplingParam.from_gen_config(gen_config=gen_config)
+        self._try_add_session(session_id)
+        msg = dict(
+            token_ids=input_ids,
+            session_id=session_id,
+            max_request_output_len=request_output_len,
+            sampling_param=sampling_param,
+            adapter_name=adapter_name,
+        )
+        req_id = self.req_sender.send_async(RequestType.ADD_MESSAGE, msg)
+
+        token_ids = []
+        while True:
+            if not self.engine.loop_threads.is_alive():
+                yield (ResponseType.ENGINE_STOP_ERROR, [], 0)
+                break
+            resp = await self.req_sender.async_recv(req_id)
+            # avoid token decoding and scheduling simultaneously
+            if resp.req_id != req_id:
+                continue
+            if resp.type == ResponseType.SUCCESS:
+                token_ids += resp.data['token_ids']
+                yield (resp.type, token_ids, len(token_ids))
+            elif resp.type == ResponseType.FINISH:
+                token_ids += resp.data['token_ids']
+                yield (resp.type, token_ids, len(token_ids))
+                break
+            else:
+                yield (resp.type, [], 0)
+                break
 
     def stream_infer(self,
                      session_id: int,
@@ -929,10 +974,8 @@ class EngineInstance:
             if not self.engine.loop_threads.is_alive():
                 yield (ResponseType.ENGINE_STOP_ERROR, [], 0)
                 break
-
             resp = self.req_sender.recv(req_id)
             # avoid token decoding and scheduling simultaneously
-            time.sleep(0.02)
             if resp.req_id != req_id:
                 continue
             if resp.type == ResponseType.SUCCESS:
@@ -979,20 +1022,13 @@ class EngineInstance:
 
     def end(self, session_id: int):
         """End the given session."""
-        if session_id not in self.owned_sessions:
-            logger.warning(f'session {session_id} is not owned '
-                           'by this instance')
         resp = self.req_sender.send(RequestType.END_SESSION,
                                     dict(session_id=session_id))
-        if _check_resp_success(resp, (f'Failed to end session: {session_id}. '
-                                      f'Error: {resp.type}.')):
-            self.owned_sessions.remove(session_id)
+        _check_resp_success(resp, (f'Failed to end session: {session_id}. '
+                                   f'Error: {resp.type}.'))
 
     def cancel(self, session_id: int):
         """Stop current streaming inference."""
-        if session_id not in self.owned_sessions:
-            logger.warning(f'session {session_id} is not owned '
-                           'by this instance')
         resp = self.req_sender.send(RequestType.STOP_SESSION,
                                     dict(session_id=session_id))
         _check_resp_success(resp, (f'Failed to cancel session: {session_id}. '

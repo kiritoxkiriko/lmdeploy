@@ -1,8 +1,9 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+import asyncio
 import enum
 from dataclasses import dataclass, field
 from queue import Empty, Queue
-from threading import Lock, Thread, ThreadError
+from threading import Lock, Thread
 from typing import Any, Callable, ClassVar, Dict, List
 
 from lmdeploy.messages import ResponseType
@@ -75,9 +76,30 @@ class RequestSender:
             except Empty:
                 timeout_counter -= self.THREAD_ALIVE_INTERVAL
             if self._thread and not self._thread.is_alive():
-                raise ThreadError('Engine main loop stopped.')
+                logger.error('Engine main loop stopped.')
+                exit(1)
 
         return self.resp_que.get(timeout=timeout_counter)
+
+    async def _async_resp_que_get(self,
+                                  block: bool = True,
+                                  timeout: float = None):
+        """warp of resp_que.get."""
+        if not block:
+            return self.resp_que(block=block, timeout=timeout)
+        timeout_counter = timeout or float(1 << 30)
+        while timeout_counter > self.THREAD_ALIVE_INTERVAL:
+            if self.resp_que.qsize() == 0:
+                await asyncio.sleep(self.THREAD_ALIVE_INTERVAL)
+                timeout_counter -= self.THREAD_ALIVE_INTERVAL
+            else:
+                return self.resp_que.get(block=False)
+            if self._thread and not self._thread.is_alive():
+                logger.error('Engine main loop stopped.')
+                exit(1)
+
+        await asyncio.sleep(self.THREAD_ALIVE_INTERVAL)
+        return self.resp_que.get(block=False)
 
     def _push_resp(self, req_id: int, resp: Response):
         """push response."""
@@ -110,7 +132,8 @@ class RequestSender:
                            data: List[Any]) -> List[int]:
         """Batched send request asynchronize."""
         if self._thread and not self._thread.is_alive():
-            raise ThreadError('Engine main loop stopped.')
+            logger.error('Engine main loop stopped.')
+            exit(1)
         assert len(req_types) == len(data)
         batch_size = len(req_types)
 
@@ -161,6 +184,23 @@ class RequestSender:
         # check resp que
         while True:
             resp: Response = self._resp_que_get(timeout=que_timeout)
+            if resp.req_id != req_id:
+                self._push_resp(req_id, resp)
+            else:
+                return resp
+
+    async def async_recv(self,
+                         req_id: int,
+                         que_timeout: float = None) -> Response:
+        """receive response of given request id async."""
+        ret = self._pop_resp(req_id, default=None)
+        if ret is not None:
+            return ret
+
+        # check resp que
+        while True:
+            resp: Response = await self._async_resp_que_get(timeout=que_timeout
+                                                            )
             if resp.req_id != req_id:
                 self._push_resp(req_id, resp)
             else:
