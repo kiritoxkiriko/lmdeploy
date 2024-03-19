@@ -94,11 +94,8 @@ instrumentator = Instrumentator(
     excluded_handlers=[".*admin.*", "/metrics"],
 ).instrument(app)
 
-
-@app.on_event("startup")
-async def _startup():
-    # set ENABLE_METRICS to True to enable metrics
-    instrumentator.expose(app)
+# expose metrics
+instrumentator.expose(app, endpoint="/metrics")
 
 
 def get_model_list():

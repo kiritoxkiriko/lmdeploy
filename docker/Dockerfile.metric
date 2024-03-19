@@ -1,8 +1,8 @@
-ARG VERSION=v0.2.5
+ARG VERSION=v0.2.6
 
 FROM openmmlab/lmdeploy:${VERSION}
 
-ENV PIP_INDEX_URL=https://mirrors.ustc.edu.cn/pypi/web/simple
+#ENV PIP_INDEX_URL=https://mirrors.ustc.edu.cn/pypi/web/simple
 
 RUN pip install --no-cache-dir prometheus_fastapi_instrumentator
 
