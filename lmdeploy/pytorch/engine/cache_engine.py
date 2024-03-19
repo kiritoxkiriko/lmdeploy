@@ -49,7 +49,7 @@ class CacheEngine:
 
         self.head_size = model_config.get_head_size()
         self.num_layers = model_config.num_layers
-        self.num_heads = model_config.num_heads
+        self.num_heads = model_config.num_key_value_heads
 
         if 'kv_cache_dtype' in model_config.json_config:
             self.kv_cache_dtype = eval(
@@ -201,7 +201,8 @@ class CacheEngine:
 
     @staticmethod
     def get_cache_block_size(block_size: int,
-                             model_config: ModelConfig) -> int:
+                             model_config: ModelConfig,
+                             world_size: int = 1) -> int:
         """Get the required cache size of the model.
 
         Args:
@@ -213,7 +214,9 @@ class CacheEngine:
         """
         head_size = model_config.get_head_size()
         num_layers = model_config.num_layers
-        num_heads = model_config.num_heads
+        num_heads = model_config.num_key_value_heads
+        if not model_config.multi_query_attention:
+            num_heads = num_heads // world_size
 
         key_cache_block = block_size * num_heads * head_size
         value_cache_block = key_cache_block

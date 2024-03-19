@@ -10,6 +10,14 @@ LMDeploy提供了快速安装、模型量化、离线批处理、在线推理服
 pip install lmdeploy
 ```
 
+LMDeploy的预编译包默认是基于 CUDA 11.8 编译的。如果需要在 CUDA 12+ 下安装 LMDeploy，请执行以下命令：
+
+```shell
+export LMDEPLOY_VERSION=0.2.0
+export PYTHON_VERSION=38
+pip install https://github.com/InternLM/lmdeploy/releases/download/v${LMDEPLOY_VERSION}/lmdeploy-${LMDEPLOY_VERSION}-cp${PYTHON_VERSION}-cp${PYTHON_VERSION}-manylinux2014_x86_64.whl
+```
+
 ## 离线批处理
 
 ```python
@@ -23,19 +31,11 @@ print(response)
 
 ## 推理服务
 
-LMDeploy `api_server` 支持把模型一键封装为服务，对外提供的 RESTful API 兼容 openai 的接口。以下为服务启动的示例：
+LMDeploy 提供了多种部署模型推理服务的方式，总有一款适合你。
 
-```shell
-lmdeploy serve api_server internlm/internlm-chat-7b
-```
-
-服务默认端口是23333。在 server 启动后，你可以在终端通过`api_client`与server进行对话：
-
-```shell
-lmdeploy serve api_client http://0.0.0.0:23333
-```
-
-除了`api_client`，你还可以通过 Swagger UI `http://0.0.0.0:23333` 在线阅读和试用 `api_server` 的各接口，也可直接查阅[文档](serving/restful_api.md)，了解各接口的定义和使用方法。
+- [部署类 openai 的服务](https://lmdeploy.readthedocs.io/zh-cn/latest//serving/api_server.html)
+- [通过 docker 部署服务](https://lmdeploy.readthedocs.io/zh-cn/latest/serving/api_server.html#docker)
+- [部署 gradio 服务](https://lmdeploy.readthedocs.io/zh-cn/latest/serving/gradio.html)
 
 ## 模型量化
 

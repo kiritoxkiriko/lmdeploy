@@ -2,6 +2,16 @@
 
 We provide a autotest caseset to do regression.
 
+## Preparation before testing
+
+To improve the efficiency of test case execution, we have downloaded the hf model files to a specific path in advance for easy use in test cases. The path where the model files are stored is defined in the `autotest/config.yaml` file with parameter `model_path`.
+
+Since the test cases involve converting the hf model using convert, the converted model storage path is defined in the `autotest/config.yaml` file parameter `dst_path`.
+
+The `autotest/config.yaml` file also defines the supported model table and corresponding model categories, such as the `model_map` parameter, as well as the log storage path `log_path` used during test case execution.
+
+If you want to create a test environment, you need to prepare the above content and modify the config.yaml file as needed.
+
 ## How to run testcases
 
 Install required dependencies using the following command line:
@@ -10,10 +20,12 @@ Install required dependencies using the following command line:
 python3 -m pip install -r requirements/test.txt
 ```
 
-Run pytest command line with case filtering through -m flag. eg: `-m internlm_chat_7b` Filter cases related to internlm_chat_7b. The corresponding results will be stored in the `allure-results` directory.
+Run pytest command line with case filtering through -m flag or folder name. eg: `-m convert` Filter cases related to convert or `autotest/tools/convert` for the case in the folder. The corresponding results will be stored in the `allure-results` directory.
 
 ```bash
-pytest autotest -m internlm_chat_7b --clean-alluredir --alluredir=allure-results
+pytest autotest -m convert --clean-alluredir --alluredir=allure-results
+pytest autotest/tools/convert --clean-alluredir --alluredir=allure-results
+
 ```
 
 If you need to generate reports and display report features, you need to install allure according to the [install documentation of allure](https://allurereport.org/docs/gettingstarted-installation/#install-via-the-system-package-manager-for-linux). You can also install it directly using the following command:
@@ -29,56 +41,45 @@ Then generate the test report and view the corresponding HTML page by using the 
 
 ```bash
 allure generate -c -o allure-reports
-
 allure open ./allure-reports
 ```
 
-## Preparation before testing
-
-To improve the efficiency of test case execution, we have downloaded the hf model files to a specific path in advance for easy use in test cases. The path where the model files are stored is defined in the `autotest/config.yaml` file with parameter `model_path`.
-
-Since the test cases involve converting the hf model using convert, the converted model storage path is defined in the `autotest/config.yaml` file parameter `dst_path`.
-
-The `autotest/config.yaml` file also defines the supported model table and corresponding model categories, such as the `model_map` parameter, as well as the log storage path `log_path` used during test case execution.
-
-If you want to create a test environment, you need to prepare the above content and modify the config.yaml file as needed.
-
 ## Test case functionality coverage
 
-The test cases cover the following functionalities:
+The testcases are including following models:
 
-![image](https://github.com/InternLM/lmdeploy/assets/145004780/19737e19-5798-4be0-b809-119da4cc65e5)
+tools model - related to tutorials, the case is basic
+
+interface model - interface function cases of pipeline、 restful api and triton server api
 
 The relationship between functionalities and test cases is as follows:
 
-|      Function      |         Test Case File         |
-| :----------------: | :----------------------------: |
-| w4a16 quantization |  test_order1_w4_quantization   |
-|      convert       |      test_order2_convert       |
-|  cli command chat  |    test_order3_command_chat    |
-|  hf command chat   | test_order3_hf_command_chat.py |
-|  restful_api chat  |    test_order4_restful_chat    |
+| case model |             Function             |                    Test Case File                    |
+| :--------: | :------------------------------: | :--------------------------------------------------: |
+|   tools    |       quantization - w4a16       |    tools/quantization/test_quantization_w4a16.py     |
+|   tools    |       quantization - w8a8        |     tools/quantization/test_quantization_w8a8.py     |
+|   tools    |      quantization - kv int8      |    tools/quantization/test_quantization_kvint8.py    |
+|   tools    | quantization - kv int8 and w4a16 | tools/quantization/test_quantization_kvint8_w4a16.py |
+|   tools    |             convert              |            tools/convert/test_convert.py             |
+|   tools    |    pipeline chat - turbomind     |    tools/pipeline/test_pipeline_chat_turbomind.py    |
+|   tools    |     pipeline chat - pytorch      |     tools/pipeline/test_pipeline_chat_pytorch.py     |
+|   tools    |   restful_api chat - turbomind   |    tools/pipeline/test_restful_chat_turbomind.py     |
+|   tools    |    restful_api chat - pytorch    |     tools/pipeline/test_restful_chat_pytorch.py      |
+|   tools    |     command chat - workspace     |      tools/chat/test_command_chat_workspace.py       |
+|   tools    |   command chat - hf turbomind    |     tools/chat/test_command_chat_hf_turbomind.py     |
+|   tools    |    command chat - hf pytorch     |      tools/chat/test_command_chat_hf_pytorch.py      |
+| interface  |    command chat - hf pytorch     |      tools/chat/test_command_chat_hf_pytorch.py      |
 
-The modules and models currently covered by the test cases are listed below:
-
-|                                   Models                                   | w4a16 quantization | convert | cli command chat | restful_api chat | hf command chat |
-| :------------------------------------------------------------------------: | :----------------: | :-----: | :--------------: | :--------------: | :-------------: |
-|   [llama2_chat_7b_w4](https://huggingface.co/lmdeploy/llama2-chat-7b-w4)   |         No         |   Yes   |       Yes        |        No        |       Yes       |
-|    [internlm_chat_7b](https://huggingface.co/internlm/internlm-chat-7b)    |         No         |   Yes   |       Yes        |        No        |       Yes       |
-|   [internlm_chat_20b](https://huggingface.co/internlm/internlm-chat-20b)   |        Yes         |   Yes   |       Yes        |        No        |       Yes       |
-|          [Qwen_7B_Chat](https://huggingface.co/Qwen/Qwen-7B-Chat)          |        Yes         |   Yes   |       Yes        |        No        |       Yes       |
-|         [Qwen_14B_Chat](https://huggingface.co/Qwen/Qwen-14B-Chat)         |        Yes         |   Yes   |       Yes        |        No        |       Yes       |
-| [Baichuan2_7B_Chat](https://huggingface.co/baichuan-inc/Baichuan2-7B-Chat) |        Yes         |   Yes   |       Yes        |        No        |       Yes       |
-|    [llama_2_7b_chat](https://huggingface.co/meta-llama/Llama-2-7b-chat)    |        Yes         |   Yes   |       Yes        |        No        |       Yes       |
+The modules and models currently covered by the turbomind and pytorch backend is in `autotest/config.yaml` by using turbomind_model and pytorch_model.
 
 ## How to add a testcase
 
-you need to confirm that the corresponding model is ready <a href="##Preparation before testing">Jump to prepare Section</a>, then you can copy the existing case in the corresponding function test file. Please modify case mark, case story, case name and parameters if need.
+If you want add a new model into tool testcase, you should repare the model in your machine <a href="##Preparation before testing">Jump to prepare Section</a> then add it into `autotest/config.yaml`.
 
 ## How to add a chatcase template
 
 We have provided some basic cases in the YAML file for dialogue testing.
-For CLI command usage with `chat_prompt_case.yaml` file, use `restful_prompt_case.yaml` file for restful api and gradio testing.
+For CLI command usage with `chat_prompt_case.yaml` file, use `prompt_case.yaml` file for pipeline chat、 restful api and gradio testing.
 
 If you want to add a dialogue case, you need to modify the corresponding YAML file.
 

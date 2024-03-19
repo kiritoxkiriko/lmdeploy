@@ -1,7 +1,8 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import os
-from typing import Literal, Optional, Union
+from typing import List, Literal, Optional, Union
 
+from .archs import autoget_backend_config, get_task
 from .messages import PytorchEngineConfig, TurbomindEngineConfig
 from .model import ChatTemplateConfig
 
@@ -31,25 +32,48 @@ def pipeline(model_path: str,
         model_name (str): needed when model_path is a pytorch model on
             huggingface.co, such as "internlm/internlm-chat-7b",
             "Qwen/Qwen-7B-Chat ", "baichuan-inc/Baichuan2-7B-Chat" and so on.
-        backend_config (TurbomindEngineConfig | PytorchEngineConfig): beckend
+        backend_config (TurbomindEngineConfig | PytorchEngineConfig): backend
             config instance. Default to None.
         chat_template_config (ChatTemplateConfig): chat template configuration.
             Default to None.
         log_level(str): set log level whose value among [CRITICAL, ERROR, WARNING, INFO, DEBUG]
 
     Examples:
+        >>> # LLM
         >>> import lmdeploy
         >>> pipe = lmdeploy.pipeline('internlm/internlm-chat-7b')
         >>> response = pipe(['hi','say this is a test'])
         >>> print(response)
+        >>>
+        >>> # VLM
+        >>> from lmdeploy.vl import load_image
+        >>> from lmdeploy import pipeline, TurbomindEngineConfig, ChatTemplateConfig
+        >>> pipe = pipeline('liuhaotian/llava-v1.5-7b',
+        ...                 backend_config=TurbomindEngineConfig(session_len=8192),
+        ...                 chat_template_config=ChatTemplateConfig(model_name='vicuna'))
+        >>> im = load_image('https://raw.githubusercontent.com/open-mmlab/mmdeploy/main/demo/resources/human-pose.jpg')
+        >>> response = pipe([('describe this image', [im])])
+        >>> print(response)
     """ # noqa E501
-    from lmdeploy.serve.async_engine import AsyncEngine
-    os.environ['TM_LOG_LEVEL'] = log_level
+    if os.getenv('TM_LOG_LEVEL') is None:
+        os.environ['TM_LOG_LEVEL'] = log_level
     from lmdeploy.utils import get_logger
     logger = get_logger('lmdeploy')
     logger.setLevel(log_level)
+
+    pipeline_type, pipeline_class = get_task(model_path)
+    if pipeline_type == 'vlm':
+        assert (type(backend_config) is TurbomindEngineConfig) or \
+            (backend_config is None), \
+            f'{pipeline_type} model only support turbomind backend.'
+
+    if pipeline_type == 'llm' and type(
+            backend_config) is not PytorchEngineConfig:
+        # set auto backend mode
+        backend_config = autoget_backend_config(model_path, backend_config)
     backend = 'pytorch' if type(
         backend_config) is PytorchEngineConfig else 'turbomind'
+    logger.info(f'Using {backend} engine')
     if 'tp' in kwargs:
         logger.warning(
             'The argument "tp" is deprecated and will be removed soon. '
@@ -58,13 +82,14 @@ def pipeline(model_path: str,
         kwargs.pop('tp')
     else:
         tp = 1 if backend_config is None else backend_config.tp
-    return AsyncEngine(model_path,
-                       model_name=model_name,
-                       backend=backend,
-                       backend_config=backend_config,
-                       chat_template_config=chat_template_config,
-                       tp=tp,
-                       **kwargs)
+
+    return pipeline_class(model_path,
+                          model_name=model_name,
+                          backend=backend,
+                          backend_config=backend_config,
+                          chat_template_config=chat_template_config,
+                          tp=tp,
+                          **kwargs)
 
 
 def serve(model_path: str,
@@ -76,6 +101,8 @@ def serve(model_path: str,
           server_name: str = '0.0.0.0',
           server_port: int = 23333,
           log_level: str = 'ERROR',
+          api_keys: Optional[Union[List[str], str]] = None,
+          ssl: bool = False,
           **kwargs):
     """This will run the api_server in a subprocess.
 
@@ -98,13 +125,16 @@ def serve(model_path: str,
             "Qwen/Qwen-7B-Chat ", "baichuan-inc/Baichuan2-7B-Chat" and so on.
         backend (str): either `turbomind` or `pytorch` backend. Default to
             `turbomind` backend.
-        backend_config (TurbomindEngineConfig | PytorchEngineConfig): beckend
+        backend_config (TurbomindEngineConfig | PytorchEngineConfig): backend
             config instance. Default to none.
         chat_template_config (ChatTemplateConfig): chat template configuration.
             Default to None.
         server_name (str): host ip for serving
         server_port (int): server port
         log_level(str): set log level whose value among [CRITICAL, ERROR, WARNING, INFO, DEBUG]
+        api_keys (List[str] | str | None): Optional list of API keys. Accepts string type as
+            a single api_key. Default to None, which means no api key applied.
+        ssl (bool): Enable SSL. Requires OS Environment variables 'SSL_KEYFILE' and 'SSL_CERTFILE'.
 
     Return:
         APIClient: A client chatbot for LLaMA series models.
@@ -120,6 +150,12 @@ def serve(model_path: str,
 
     from lmdeploy.serve.openai.api_client import APIClient
     from lmdeploy.serve.openai.api_server import serve
+
+    if type(backend_config) is not PytorchEngineConfig:
+        # set auto backend mode
+        backend_config = autoget_backend_config(model_path, backend_config)
+    backend = 'pytorch' if type(
+        backend_config) is PytorchEngineConfig else 'turbomind'
     if 'tp' in kwargs:
         tp = kwargs['tp']
         kwargs.pop('tp')
@@ -135,25 +171,36 @@ def serve(model_path: str,
                                server_port=server_port,
                                tp=tp,
                                log_level=log_level,
-                               **kwargs))
+                               api_keys=api_keys,
+                               ssl=ssl,
+                               **kwargs),
+                   daemon=True)
     task.start()
     client = APIClient(f'http://{server_name}:{server_port}')
     while True:
         time.sleep(1)
         try:
             client.available_models
+            print(
+                f'Launched the api_server in process {task.pid}, user can '
+                f'kill the server by:\nimport os,signal\nos.kill({task.pid}, '
+                'signal.SIGKILL)')
             return client
         except:  # noqa
             pass
 
 
-def client(api_server_url: str = 'http://0.0.0.0:23333', **kwargs):
+def client(api_server_url: str = 'http://0.0.0.0:23333',
+           api_key: Optional[str] = None,
+           **kwargs):
     """
     Args:
         api_server_url (str): communicating address 'http://<ip>:<port>' of
             api_server
+        api_key (str | None): api key. Default to None, which means no
+            api key will be used.
     Return:
         Chatbot for LLaMA series models with turbomind as inference engine.
     """
     from lmdeploy.serve.openai.api_client import APIClient
-    return APIClient(api_server_url, **kwargs)
+    return APIClient(api_server_url, api_key, **kwargs)

@@ -101,6 +101,7 @@ def _acc_b_mm_kernel(
     B_start_loc,
     B_seq_lens,
     B_adapter_id,
+    B_scaling,
     Rank_page_table,
     Rank_page_start,
     Ranks,
@@ -127,6 +128,7 @@ def _acc_b_mm_kernel(
 
     start_loc = tl.load(B_start_loc + cur_batch)
     adapter_id = tl.load(B_adapter_id + cur_batch)
+    scaling = tl.load(B_scaling + cur_batch)
     rank = tl.load(Ranks + adapter_id)
     page_start = tl.load(Rank_page_start + adapter_id)
 
@@ -164,6 +166,7 @@ def _acc_b_mm_kernel(
         # compute
         out = tl.dot(acc, lb)
         out = out.to(lb.dtype)
+        out = out * scaling
 
         # store o
         oh_off = cur_dm_off * stride_oh
@@ -174,9 +177,9 @@ def _acc_b_mm_kernel(
 @torch.inference_mode()
 def mbgmm_a(x: Tensor,
             lora_a: Tensor,
-            b_start_loc: Tensor,
-            b_seq_lens: Tensor,
-            b_adapter_ids: Tensor,
+            q_start_loc: Tensor,
+            q_seqlens: Tensor,
+            adapter_ids: Tensor,
             rank_page_table: Tensor,
             ranks: Tensor,
             rank_page_start: Tensor,
@@ -197,7 +200,7 @@ def mbgmm_a(x: Tensor,
     assert rank_page_table.dim() == 2
 
     head_size = x.size(-1)
-    batch_size = len(b_seq_lens)
+    batch_size = len(q_seqlens)
     max_rank = max_rank // rank_step
 
     BLOCK_M = 32
@@ -214,9 +217,9 @@ def mbgmm_a(x: Tensor,
     _x_a_mm_kernel[grid](x,
                          lora_a,
                          xa,
-                         b_start_loc,
-                         b_seq_lens,
-                         b_adapter_ids,
+                         q_start_loc,
+                         q_seqlens,
+                         adapter_ids,
                          Rank_page_table=rank_page_table,
                          Rank_page_start=rank_page_start,
                          Ranks=ranks,
@@ -241,9 +244,10 @@ def mbgmm_a(x: Tensor,
 @torch.inference_mode()
 def mbgmm_b(xa: Tensor,
             lora_b: Tensor,
-            b_start_loc: Tensor,
-            b_seq_lens: Tensor,
-            b_adapter_ids: Tensor,
+            q_start_loc: Tensor,
+            q_seqlens: Tensor,
+            adapter_ids: Tensor,
+            scaling: Tensor,
             rank_page_table: Tensor,
             ranks: Tensor,
             rank_page_start: Tensor,
@@ -265,7 +269,7 @@ def mbgmm_b(xa: Tensor,
 
     if out_size is None:
         out_size = lora_b.size(-1)
-    batch_size = len(b_seq_lens)
+    batch_size = len(q_seqlens)
 
     BLOCK_M = 32
     BLOCK_R = _next_pow_of_2(max_rank)
@@ -281,9 +285,10 @@ def mbgmm_b(xa: Tensor,
     _acc_b_mm_kernel[grid](xa,
                            lora_b,
                            output,
-                           b_start_loc,
-                           b_seq_lens,
-                           b_adapter_ids,
+                           q_start_loc,
+                           q_seqlens,
+                           adapter_ids,
+                           scaling,
                            Rank_page_table=rank_page_table,
                            Rank_page_start=rank_page_start,
                            Ranks=ranks,

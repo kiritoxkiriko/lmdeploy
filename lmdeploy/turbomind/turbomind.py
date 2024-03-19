@@ -6,13 +6,12 @@ import os.path as osp
 import sys
 from configparser import ConfigParser
 from contextlib import contextmanager
-from queue import Queue
+from queue import LifoQueue, Queue
 from threading import Thread
 from typing import Iterable, List, Optional, Union
 
 import numpy as np
 import torch
-from huggingface_hub import snapshot_download
 from torch.nn.utils.rnn import pad_sequence
 
 import lmdeploy
@@ -21,20 +20,20 @@ from lmdeploy.messages import (EngineGenerationConfig, ResponseType,
 from lmdeploy.model import (MODELS, BaseModel, ChatTemplateConfig,
                             best_match_model)
 from lmdeploy.tokenizer import Tokenizer
-from lmdeploy.utils import _stop_words, get_logger
+from lmdeploy.utils import _stop_words, get_logger, get_model
 
 from .deploy.converter import (get_model_format, supported_formats,
                                update_config_weight_type, update_output_format)
 from .deploy.source_model.base import INPUT_MODELS
 from .deploy.target_model.base import OUTPUT_MODELS, TurbomindModelConfig
-from .utils import ModelSource, create_hf_download_args, get_model_source
+from .utils import ModelSource, get_model_from_config, get_model_source
 
 # TODO: find another way import _turbomind
 lmdeploy_dir = osp.split(lmdeploy.__file__)[0]
 sys.path.append(osp.join(lmdeploy_dir, 'lib'))
 import _turbomind as _tm  # noqa: E402
 
-logger = logging.getLogger(__name__)
+logger = get_logger('lmdeploy')
 
 
 def _construct_stop_or_bad_words(words: List[int] = None):
@@ -71,13 +70,20 @@ def _update_engine_config(config: TurbomindEngineConfig, **kwargs):
     for k, v in kwargs.items():
         if v and hasattr(config, k):
             setattr(config, k, v)
-            get_logger('turbomind').warning(
-                f'kwargs {k} is deprecated to initialize model, '
-                'use TurbomindEngineConfig instead.')
+            logger.warning(f'kwargs {k} is deprecated to initialize model, '
+                           'use TurbomindEngineConfig instead.')
+    if config.model_name is not None:
+        logger.warning('model_name is deprecated in TurbomindEngineConfig '
+                       'and has no effect')
     return config
 
 
 def _update_tm_config(dst: TurbomindModelConfig, src: TurbomindEngineConfig):
+    # A workaround to support max token number of each iteration in prefill
+    if src.max_prefill_token_num is not None and src.session_len is not None:
+        dst.num_tokens_per_iter = src.max_prefill_token_num
+        dst.max_prefill_iters = (src.session_len + src.max_prefill_token_num -
+                                 1) // src.max_prefill_token_num
     dst_dict = copy.deepcopy(dst.__dict__)
     src_dict = copy.deepcopy(src.__dict__)
     src_dict['tensor_para_size'] = src_dict['tp']
@@ -85,6 +91,30 @@ def _update_tm_config(dst: TurbomindModelConfig, src: TurbomindEngineConfig):
         if v is not None and k in dst_dict:
             dst_dict[k] = v
     return TurbomindModelConfig.from_dict(dst_dict)
+
+
+def _compare_individual_gpu_memory(tp: int):
+    logger.setLevel(level=logging.INFO)
+    try:
+        total_mem = []
+        free_mem = []
+
+        for i in range(tp):
+            torch.cuda.set_device(i)
+            free, total = torch.cuda.mem_get_info()
+            total_mem.append(total / (1024**2))
+            free_mem.append(free / (1024**2))
+
+        all_total_equal = all(total == total_mem[0] for total in total_mem)
+        all_free_equal = all(free == free_mem[0] for free in free_mem)
+
+        if not all_total_equal or not all_free_equal:
+            logger.warning(
+                f'Memory discrepancy detected: Total Memory={total_mem} MB, \
+Free Memory={free_mem} MB')
+
+    except Exception as e:
+        logger.error(f'An exception occurred: {e}')
 
 
 @contextmanager
@@ -120,13 +150,13 @@ class TurboMind:
                  tp: Optional[int] = None,
                  chat_template_config: Optional[ChatTemplateConfig] = None,
                  **kwargs):
-
-        # check model_name equal in engine_config and passed in
-        if engine_config is not None and engine_config.model_name is not None:
-            if model_name is not None:
-                assert model_name == engine_config.model_name, 'Got different'
-                f' model names. model_name: {model_name}, engine_config model '
-                f'name: {engine_config.model_name}'
+        # check memory equality when tp
+        if tp is not None:
+            if tp > 1:
+                _compare_individual_gpu_memory(tp)
+        elif engine_config is not None and engine_config.tp is not None:
+            if engine_config.tp > 1:
+                _compare_individual_gpu_memory(engine_config.tp)
 
         # if loading from workspace and engine_config is None, use config.ini
         # and ignore passed args like model_format, tp, etc.
@@ -139,33 +169,18 @@ class TurboMind:
                         args.append(k)
                 return args
 
-            args = _catch_args(**kwargs,
-                               model_name=model_name,
-                               model_format=model_format,
-                               tp=tp)
+            args = _catch_args(**kwargs, model_format=model_format, tp=tp)
             if len(args) > 0:
-                get_logger('turbomind').warning(
+                logger.warning(
                     f'loading from workspace, ignore args {args} '
                     'please use TurbomindEngineConfig or modify config.ini')
 
         else:
             engine_config = _update_engine_config(engine_config,
-                                                  model_name=model_name,
                                                   model_format=model_format,
                                                   group_size=group_size,
                                                   tp=tp,
                                                   **kwargs)
-
-        # match model name
-        if model_source == ModelSource.HF_MODEL and \
-                engine_config.model_name is None:
-            potential_names = best_match_model(model_path)
-            if potential_names is None:
-                logger.warning(f'Please input a model_name for {model_source}')
-            else:
-                engine_config.model_name = potential_names
-                logger.warning('Best matched chat template name: '
-                               f'{engine_config.model_name}')
 
         tp = engine_config.tp if engine_config is not None else 1
         assert ((tp & (tp - 1) == 0) and tp != 0), 'tp should be 2^n'
@@ -178,6 +193,9 @@ class TurboMind:
             self.model_comm = self._from_workspace(model_path=model_path,
                                                    engine_config=engine_config)
         else:
+            if not osp.exists(model_path):
+                model_path = get_model(model_path, engine_config.download_dir,
+                                       engine_config.revision)
             self.tokenizer = Tokenizer(model_path)
             self.model_comm = self._from_hf(model_source=model_source,
                                             model_path=model_path,
@@ -262,9 +280,6 @@ class TurboMind:
         """Load model which is in hf format."""
         assert model_source == ModelSource.HF_MODEL, \
             f'{model_source} is not supported'
-        assert engine_config.model_name in MODELS.module_dict.keys(), \
-            f"'{engine_config.model_name}' is not supported. " \
-            f'The supported models are: {MODELS.module_dict.keys()}'
         assert engine_config.model_format in supported_formats, \
             f'The model format should be in {supported_formats}'
 
@@ -273,18 +288,24 @@ class TurboMind:
                 engine_config.model_format is None:
             engine_config.model_format = 'awq'
 
+        # when convert model, use architectures in config.json
+        model_arch = get_model_from_config(model_path)
         data_type = 'fp16'
         output_format = 'fp16'
-        inferred_model_format = get_model_format(engine_config.model_name,
+        inferred_model_format = get_model_format(model_arch,
                                                  engine_config.model_format)
         cfg = TurbomindModelConfig.from_engine_config(engine_config)
+        match_name = best_match_model(model_path)
+        # for session len
+        cfg.model_name = match_name \
+            if match_name is not None else 'base'
         if inferred_model_format.find('awq') != -1:
             cfg.weight_type = 'int4'
             output_format = 'w4'
             data_type = 'int4'
             cfg.group_size = 128
         else:
-            output_format = update_output_format(engine_config.model_name,
+            output_format = update_output_format(cfg.model_name,
                                                  inferred_model_format,
                                                  model_path, output_format)
             data_type = output_format
@@ -300,8 +321,8 @@ class TurboMind:
         if engine_config.session_len is not None:
             cfg.session_len = engine_config.session_len
 
+        self.model_name = cfg.model_name
         self.config = cfg
-        self.model_name = engine_config.model_name
         self.data_type = data_type
 
         logger.warning(f'model_config:\n\n{cfg.toini()}')
@@ -343,8 +364,7 @@ class TurboMind:
         # check whether input tp is valid
         if cfg.tensor_para_size != 1 and \
                 self.gpu_count != cfg.tensor_para_size:
-            get_logger('turbomind').info(
-                f'found tp={cfg.tensor_para_size} in config.ini.')
+            logger.info(f'found tp={cfg.tensor_para_size} in config.ini.')
             self.gpu_count = cfg.tensor_para_size
 
         # update cfg
@@ -407,26 +427,10 @@ class TurboMind:
                 Can be used to update configuration when initialize the engine.
         """
         model_source = get_model_source(pretrained_model_name_or_path)
-        if model_source == ModelSource.WORKSPACE:
-            local_path = pretrained_model_name_or_path
-        else:
-            if model_name is None and (engine_config is None
-                                       or engine_config.model_name is None):
-                # huggingface repo id will be changed to local path in .cache
-                # have to match name in ahead.
-                model_name = best_match_model(pretrained_model_name_or_path)
-            if not osp.exists(pretrained_model_name_or_path):
-                download_kwargs = create_hf_download_args(**kwargs)
-                local_path = snapshot_download(pretrained_model_name_or_path,
-                                               **download_kwargs)
-            else:
-                local_path = pretrained_model_name_or_path
-
         logger.warning(f'model_source: {model_source}')
-        return cls(model_path=local_path,
+        return cls(model_path=pretrained_model_name_or_path,
                    engine_config=engine_config,
                    model_source=model_source,
-                   model_name=model_name,
                    model_format=model_format,
                    group_size=group_size,
                    tp=tp,
@@ -508,6 +512,27 @@ class TurboMindInstance:
             t.start()
             self.threads[device_id] = t
 
+    def _async_forward_callback(self, result, ctx, que: LifoQueue):
+        que.put((False, result))
+
+    def _async_forward_thread(self, inputs, que: LifoQueue):
+        instance_comm = self.tm_model.model_comm.create_instance_comm(
+            self.gpu_count)
+
+        def _func(device_id, enque_output):
+            with cuda_ctx(device_id):
+                output = self.model_insts[device_id].forward(
+                    inputs, instance_comm)
+                if enque_output:
+                    que.put((True, output))
+
+        for device_id in range(self.gpu_count):
+            t = Thread(target=_func,
+                       args=(device_id, device_id == 0),
+                       daemon=True)
+            t.start()
+            self.threads[device_id] = t
+
     def _update_generation_config(self, config: EngineGenerationConfig,
                                   **kwargs: dict):
         if config is None:
@@ -522,13 +547,12 @@ class TurboMindInstance:
             if k in config.__dict__:
                 config.__dict__[k] = v
                 deprecated_kwargs.append(k)
-        if kwargs.get('request_output_len'):
+        if 'request_output_len' in kwargs:
             config.max_new_tokens = kwargs['request_output_len']
             deprecated_kwargs.append('request_output_len')
         for k in deprecated_kwargs:
-            get_logger('turbomind').warning(
-                f'kwargs {k} is deprecated for inference, '
-                'use GenerationConfig instead.')
+            logger.warning(f'kwargs {k} is deprecated for inference, '
+                           'use GenerationConfig instead.')
         return config
 
     def end(self, session_id: int):
@@ -542,6 +566,11 @@ class TurboMindInstance:
                                                   sequence_end=True):
             pass
 
+    async def async_end(self, session_id: int):
+        """End the given session."""
+        self.end(session_id)
+        await asyncio.sleep(0.002)
+
     def cancel(self, session_id: int):
         """Stop current streaming inference."""
         input_ids = [self.tm_model.tokenizer.eos_token_id]
@@ -553,6 +582,11 @@ class TurboMindInstance:
                                                    sequence_end=False,
                                                    stop=True):
             pass
+
+    async def async_cancel(self, session_id: int):
+        """End the given session."""
+        self.cancel(session_id)
+        await asyncio.sleep(0.002)
 
     def prepare_inputs(self,
                        session_id,
@@ -648,6 +682,10 @@ class TurboMindInstance:
             inputs['input_embeddings'] = input_embeddings
             inputs['input_embedding_ranges'] = input_embedding_ranges
 
+        if gen_config.min_new_tokens is not None:
+            inputs['min_length'] = _broadcast_np(gen_config.min_new_tokens,
+                                                 np.int32)
+
         bad_words = []
         if gen_config.bad_words is not None:
             bad_words.extend(gen_config.bad_words)
@@ -697,8 +735,13 @@ class TurboMindInstance:
             stream_output (bool): indicator for stream output
             kwargs (dict): kwargs for backward compatibility
         """
+        # start forward thread
+        que = LifoQueue()
+        from functools import partial
+        _forward_callback = partial(self._async_forward_callback, que=que)
+        _forward_thread = partial(self._async_forward_thread, que=que)
         if stream_output and not stop:
-            self.model_insts[0].register_callback(self._forward_callback)
+            self.model_insts[0].register_callback(_forward_callback)
 
         gen_config = self._update_generation_config(gen_config, **kwargs)
         inputs, input_lengths = self.prepare_inputs(
@@ -713,23 +756,17 @@ class TurboMindInstance:
             gen_config=gen_config)
 
         tm_inputs = _np_dict_to_tm_dict(inputs)
-        # start forward thread
-        self.que = Queue()
-        self._forward_thread(tm_inputs)
+        _forward_thread(tm_inputs)
 
         seq_start = input_lengths + input_lengths.new_tensor(step)
 
+        prev_len = 0
         # generator
         while True:
-            # Thanks for https://github.com/frankxyy and his issue
-            # https://github.com/InternLM/lmdeploy/issues/832
-            while self.que.qsize() == 0:
-                await asyncio.sleep(0.002)  # sleep(0) makes server unstable
+            while que.qsize() == 0:  # let other requests in
+                await asyncio.sleep(0.002)
 
-            while self.que.qsize() > 1:
-                self.que.get()
-
-            finish, tm_outputs = self.que.get()
+            finish, tm_outputs = que.get()
 
             outputs = _tm_dict_to_torch_dict(tm_outputs)
 
@@ -754,13 +791,15 @@ class TurboMindInstance:
                     outputs = (status, output[:-1].tolist(), len_)
                 else:
                     outputs = (status, output.tolist(), len_)
+            if outputs[-1] < prev_len and not finish:
+                continue
+            else:
+                prev_len = outputs[-1]
             yield outputs
 
             if finish:
                 for t in self.threads:
                     t.join()
-                while self.que.qsize() > 0:
-                    self.que.get()
                 break
 
         if stream_output and not stop:
@@ -940,7 +979,7 @@ class TurboMindInstance:
             max([len(input_id)
                  for input_id in input_ids]) / max_input_len).astype(int)
 
-        device = 'cpu' if n_max_iter > 0 else 'cuda'
+        device = 'cpu' if n_max_iter > 1 else 'cuda'
 
         index_range_starts = []
         index_range_ends = []

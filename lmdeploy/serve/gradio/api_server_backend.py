@@ -38,7 +38,7 @@ def chat_stream_restful(instruction: str, state_chatbot: Sequence,
             interactive_mode=True,
             top_p=top_p,
             temperature=temperature):
-        if finish_reason == 'length':
+        if finish_reason == 'length' and tokens == 0:
             gr.Warning('WARNING: exceed session max length.'
                        ' Please restart the session by reset button.')
         if tokens < 0:
@@ -109,6 +109,7 @@ def cancel_restful_func(state_chatbot: gr.State, cancel_btn: gr.Button,
             interactive_mode=False):
         pass
     # resume the session
+    # TODO this is not proper if api server is running pytorch backend
     messages = []
     for qa in state_chatbot:
         messages.append(dict(role='user', content=qa[0]))

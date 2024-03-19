@@ -1,6 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from .cli import CLI
-from .utils import ArgumentHelper, DefaultsAndTypesHelpFormatter, convert_args
+from .utils import (ArgumentHelper, DefaultsAndTypesHelpFormatter,
+                    convert_args, get_lora_adapters)
 
 
 class SubCliChat(object):
@@ -12,6 +13,7 @@ class SubCliChat(object):
 
     @staticmethod
     def add_parser_torch():
+        """Add parser for torch command."""
         parser = SubCliChat.subparsers.add_parser(
             'torch',
             formatter_class=DefaultsAndTypesHelpFormatter,
@@ -28,6 +30,7 @@ class SubCliChat(object):
         ArgumentHelper.tp(engine_group)
         ArgumentHelper.session_len(engine_group)
         ArgumentHelper.adapters(engine_group)
+        ArgumentHelper.cache_max_entry_count(engine_group)
 
         # other args
         parser.add_argument('--trust-remote-code',
@@ -37,6 +40,7 @@ class SubCliChat(object):
 
     @staticmethod
     def add_parser_turbomind():
+        """Add parser for turbomind command."""
         parser = SubCliChat.subparsers.add_parser(
             'turbomind',
             formatter_class=DefaultsAndTypesHelpFormatter,
@@ -62,18 +66,21 @@ class SubCliChat(object):
         ArgumentHelper.session_len(engine_group)
         # other arguments
         ArgumentHelper.cap(parser)
-        ArgumentHelper.meta_instruction(parser)
+        ArgumentHelper.meta_instruction(parser)  # TODO remove
+        ArgumentHelper.chat_template(parser)
 
     @staticmethod
     def torch(args):
         """Chat with PyTorch inference engine through terminal."""
         from lmdeploy.messages import PytorchEngineConfig
         from lmdeploy.pytorch.chat import run_chat
-
-        engine_config = PytorchEngineConfig(model_name=args.model_name,
-                                            tp=args.tp,
-                                            session_len=args.session_len,
-                                            adapters=args.adapters)
+        adapters = get_lora_adapters(args.adapters)
+        engine_config = PytorchEngineConfig(
+            model_name=args.model_name,
+            tp=args.tp,
+            session_len=args.session_len,
+            cache_max_entry_count=args.cache_max_entry_count,
+            adapters=adapters)
         run_chat(args.model_path,
                  engine_config,
                  trust_remote_code=args.trust_remote_code)
@@ -83,6 +90,16 @@ class SubCliChat(object):
         """Chat with TurboMind inference engine through terminal."""
         from lmdeploy.turbomind.chat import main
         kwargs = convert_args(args)
+        from lmdeploy.model import ChatTemplateConfig
+        chat_template_config = ChatTemplateConfig(
+            model_name=args.model_name,
+            meta_instruction=args.meta_instruction,
+            capability=args.cap)
+        if args.chat_template:
+            chat_template_config = ChatTemplateConfig.from_json(
+                args.chat_template)
+        kwargs.update(dict(chat_template_cfg=chat_template_config))
+        kwargs.pop('chat_template', None)
         main(**kwargs)
 
     @staticmethod

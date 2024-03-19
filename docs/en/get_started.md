@@ -10,6 +10,14 @@ Install lmdeploy with pip (python 3.8+) or [from source](./build.md)
 pip install lmdeploy
 ```
 
+The default prebuilt package is compiled on CUDA 11.8. However, if CUDA 12+ is required, you can install lmdeploy by:
+
+```shell
+export LMDEPLOY_VERSION=0.2.0
+export PYTHON_VERSION=38
+pip install https://github.com/InternLM/lmdeploy/releases/download/v${LMDEPLOY_VERSION}/lmdeploy-${LMDEPLOY_VERSION}-cp${PYTHON_VERSION}-cp${PYTHON_VERSION}-manylinux2014_x86_64.whl
+```
+
 ## Offline batch inference
 
 ```python
@@ -23,19 +31,11 @@ For more information on inference pipeline parameters, please refer to [here](./
 
 ## Serving
 
-LMDeploy's `api_server` enables models to be easily packed into services with a single command. The provided RESTful APIs are compatible with OpenAI's interfaces. Below are an example of service startup:
+LMDeploy offers various serving methods, choosing one that best meet your requirements.
 
-```shell
-lmdeploy serve api_server internlm/internlm-chat-7b
-```
-
-The default port of `api_server` is `23333`. After the server is launched, you can communicate with server on terminal through `api_client`:
-
-```shell
-lmdeploy serve api_client http://0.0.0.0:23333
-```
-
-You can overview and try out `api_server` APIs online by swagger UI at `http://0.0.0.0:23333`, or you can read the API specification from [here](serving/restful_api.md).
+- [Serving with openai compatible server](https://lmdeploy.readthedocs.io/en/latest/serving/api_server.html)
+- [Serving with docker](https://lmdeploy.readthedocs.io/en/latest/serving/api_server.html#option-2-deploying-with-docker)
+- [Serving with gradio](https://lmdeploy.readthedocs.io/en/latest/serving/gradio.html)
 
 ## Quantization
 

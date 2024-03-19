@@ -290,9 +290,31 @@ print(torch._C._GLIBCXX_USE_CXX11_ABI,end='');"
   endif()
 endif()
 
+# turn off warnings on windows
+if (MSVC)
+  foreach(
+    flag_var
+    CMAKE_CXX_FLAGS
+    CMAKE_CXX_FLAGS_DEBUG
+    CMAKE_CXX_FLAGS_RELEASE
+    CMAKE_CXX_FLAGS_MINSIZEREL
+    CMAKE_CXX_FLAGS_RELWITHDEBINFO
+    CMAKE_C_FLAGS
+    CMAKE_C_FLAGS_DEBUG
+    CMAKE_C_FLAGS_RELEASE
+    CMAKE_C_FLAGS_MINSIZEREL
+    CMAKE_C_FLAGS_RELWITHDEBINFO
+    CMAKE_CUDA_FLAGS
+    CMAKE_CUDA_FLAGS_DEBUG
+    CMAKE_CUDA_FLAGS_RELEASE
+    CMAKE_CUDA_FLAGS_MINSIZEREL
+    CMAKE_CUDA_FLAGS_RELWITHDEBINFO)
+    string(REGEX REPLACE "-Wall" " /W0 " ${flag_var} "${${flag_var}}")
+  endforeach()
+endif()
+
 if (BUILD_MULTI_GPU)
   list(APPEND COMMON_HEADER_DIRS ${MPI_INCLUDE_PATH})
-  list(APPEND COMMON_LIB_DIRS /usr/local/mpi/lib)
 endif()
 
 if(USE_TRITONSERVER_DATATYPE)
@@ -374,7 +396,7 @@ add_library(transformer-shared SHARED
 
 if (BUILD_MULTI_GPU)
 target_link_libraries(transformer-shared PUBLIC
-  -lmpi
+  ${MPI_CXX_LIBRARIES}
   ${NCCL_LIBRARIES}
 )
 endif()

@@ -1,16 +1,17 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import asyncio
 import os
-import random
 import time
 from http import HTTPStatus
 from typing import AsyncGenerator, List, Literal, Optional, Union
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.security.http import HTTPAuthorizationCredentials, HTTPBearer
 
+from lmdeploy.archs import get_task
 from lmdeploy.messages import (GenerationConfig, PytorchEngineConfig,
                                TurbomindEngineConfig)
 from lmdeploy.model import ChatTemplateConfig
@@ -25,16 +26,47 @@ from lmdeploy.serve.openai.protocol import (  # noqa: E501
     GenerateRequest, GenerateRequestQos, GenerateResponse, ModelCard,
     ModelList, ModelPermission, UsageInfo)
 from lmdeploy.serve.qos_engine.qos_engine import QosEngine
+from lmdeploy.utils import get_logger
 
 
 class VariableInterface:
     """A IO interface maintaining variables."""
     async_engine: AsyncEngine = None
+    session_id: int = 0
+    api_keys: Optional[List[str]] = None
     qos_engine: QosEngine = None
     request_hosts = []
 
 
 app = FastAPI(docs_url='/')
+get_bearer_token = HTTPBearer(auto_error=False)
+
+
+async def check_api_key(
+    auth: Optional[HTTPAuthorizationCredentials] = Depends(get_bearer_token),
+) -> str:
+    """Check if client provide valid api key.
+
+    Adopted from https://github.com/lm-sys/FastChat/blob/v0.2.35/fastchat/serve/openai_api_server.py#L108-L127
+    """  # noqa
+    if VariableInterface.api_keys:
+        if auth is None or (
+                token := auth.credentials) not in VariableInterface.api_keys:
+            raise HTTPException(
+                status_code=401,
+                detail={
+                    'error': {
+                        'message': 'Please request with valid api key!',
+                        'type': 'invalid_request_error',
+                        'param': None,
+                        'code': 'invalid_api_key',
+                    }
+                },
+            )
+        return token
+    else:
+        # api_keys not set; allow all
+        return None
 
 
 def get_model_list():
@@ -42,10 +74,10 @@ def get_model_list():
 
     Only provided one now.
     """
-    return [VariableInterface.async_engine.engine.model_name]
+    return [VariableInterface.async_engine.model_name]
 
 
-@app.get('/v1/models')
+@app.get('/v1/models', dependencies=[Depends(check_api_key)])
 def available_models():
     """Show available models."""
     model_cards = []
@@ -79,16 +111,6 @@ async def check_request(request) -> Optional[JSONResponse]:
     return ret
 
 
-def ip2id(host_ip: str):
-    """Convert host ip address to session id."""
-    if '.' in host_ip:  # IPv4
-        return int(host_ip.replace('.', '')[-8:])
-    if ':' in host_ip:  # IPv6
-        return int(host_ip.replace(':', '')[-8:], 16)
-    print('Warning, could not get session id from ip, set it 0')
-    return 0
-
-
 @app.post('/v1/chat/completions_qos')
 async def chat_completions_v1_qos(request: ChatCompletionRequestQos,
                                   raw_request: Request = None):
@@ -113,7 +135,6 @@ async def chat_completions_v1_qos(request: ChatCompletionRequestQos,
 
     Additional arguments supported by LMDeploy:
     - ignore_eos (bool): indicator for ignoring eos
-    - session_id (int): if not specified, will set random value
     - user_id (str): for qos; if not specified, will set to "default"
 
     Currently we do not support the following features:
@@ -122,8 +143,8 @@ async def chat_completions_v1_qos(request: ChatCompletionRequestQos,
     - presence_penalty (replaced with repetition_penalty)
     - frequency_penalty (replaced with repetition_penalty)
     """
-    if request.session_id == -1:
-        request.session_id = random.randint(1, 10086)
+    VariableInterface.session_id += 1
+    request.session_id = VariableInterface.session_id
     error_check_ret = await check_request(request)
     if error_check_ret is not None:
         return error_check_ret
@@ -197,7 +218,8 @@ async def chat_completions_v1_qos(request: ChatCompletionRequestQos,
     async for res in result_generator:
         if await raw_request.is_disconnected():
             # Abort the request if the client disconnects.
-            VariableInterface.async_engine.stop_session(request.session_id)
+            await VariableInterface.async_engine.stop_session(
+                request.session_id)
             return create_error_response(HTTPStatus.BAD_REQUEST,
                                          'Client disconnected')
         final_res = res
@@ -231,7 +253,7 @@ async def chat_completions_v1_qos(request: ChatCompletionRequestQos,
     return response
 
 
-@app.post('/v1/chat/completions')
+@app.post('/v1/chat/completions', dependencies=[Depends(check_api_key)])
 async def chat_completions_v1(request: ChatCompletionRequest,
                               raw_request: Request = None):
     """Completion API similar to OpenAI's API.
@@ -250,15 +272,18 @@ async def chat_completions_v1(request: ChatCompletionRequest,
     - n (int): How many chat completion choices to generate for each input
         message. Only support one here.
     - stream: whether to stream the results or not. Default to false.
-    - max_tokens (int): output token nums
+    - max_tokens (int | None): output token nums. Default to None.
     - repetition_penalty (float): The parameter for repetition penalty.
         1.0 means no penalty
     - stop (str | List[str] | None): To stop generating further
         tokens. Only accept stop words that's encoded to one token idex.
 
     Additional arguments supported by LMDeploy:
+    - top_k (int): The number of the highest probability vocabulary
+        tokens to keep for top-k-filtering
     - ignore_eos (bool): indicator for ignoring eos
-    - session_id (int): if not specified, will set random value
+    - skip_special_tokens (bool): Whether or not to remove special tokens
+        in the decoding. Default to be True.
 
     Currently we do not support the following features:
     - function_call (Users should implement this by themselves)
@@ -266,8 +291,8 @@ async def chat_completions_v1(request: ChatCompletionRequest,
     - presence_penalty (replaced with repetition_penalty)
     - frequency_penalty (replaced with repetition_penalty)
     """
-    if request.session_id == -1:
-        request.session_id = random.randint(1, 10086)
+    VariableInterface.session_id += 1
+    request.session_id = VariableInterface.session_id
     error_check_ret = await check_request(request)
     if error_check_ret is not None:
         return error_check_ret
@@ -280,12 +305,14 @@ async def chat_completions_v1(request: ChatCompletionRequest,
         request.stop = [request.stop]
 
     gen_config = GenerationConfig(
-        max_new_tokens=request.max_tokens if request.max_tokens else 512,
+        max_new_tokens=request.max_tokens,
+        top_k=request.top_k,
         top_p=request.top_p,
         temperature=request.temperature,
         repetition_penalty=request.repetition_penalty,
         ignore_eos=request.ignore_eos,
-        stop_words=request.stop)
+        stop_words=request.stop,
+        skip_special_tokens=request.skip_special_tokens)
 
     result_generator = VariableInterface.async_engine.generate(
         request.messages,
@@ -352,7 +379,8 @@ async def chat_completions_v1(request: ChatCompletionRequest,
     async for res in result_generator:
         if await raw_request.is_disconnected():
             # Abort the request if the client disconnects.
-            VariableInterface.async_engine.stop_session(request.session_id)
+            await VariableInterface.async_engine.stop_session(
+                request.session_id)
             return create_error_response(HTTPStatus.BAD_REQUEST,
                                          'Client disconnected')
         final_res = res
@@ -414,7 +442,6 @@ async def completions_v1_qos(request: CompletionRequestQos,
     - top_k (int): The number of the highest probability vocabulary
         tokens to keep for top-k-filtering
     - ignore_eos (bool): indicator for ignoring eos
-    - session_id (int): if not specified, will set random value
     - user_id (str): for qos; if not specified, will set to "default"
 
     Currently we do not support the following features:
@@ -422,8 +449,8 @@ async def completions_v1_qos(request: CompletionRequestQos,
     - presence_penalty (replaced with repetition_penalty)
     - frequency_penalty (replaced with repetition_penalty)
     """
-    if request.session_id == -1:
-        request.session_id = random.randint(1, 10086)
+    VariableInterface.session_id += 1
+    request.session_id = VariableInterface.session_id
     error_check_ret = await check_request(request)
     if error_check_ret is not None:
         return error_check_ret
@@ -499,7 +526,8 @@ async def completions_v1_qos(request: CompletionRequestQos,
         async for res in generator:
             if await raw_request.is_disconnected():
                 # Abort the request if the client disconnects.
-                VariableInterface.async_engine.stop_session(request.session_id)
+                await VariableInterface.async_engine.stop_session(
+                    request.session_id)
                 return create_error_response(HTTPStatus.BAD_REQUEST,
                                              'Client disconnected')
             final_res = res
@@ -534,7 +562,7 @@ async def completions_v1_qos(request: CompletionRequestQos,
     return response
 
 
-@app.post('/v1/completions')
+@app.post('/v1/completions', dependencies=[Depends(check_api_key)])
 async def completions_v1(request: CompletionRequest,
                          raw_request: Request = None):
     """Completion API similar to OpenAI's API.
@@ -546,7 +574,7 @@ async def completions_v1(request: CompletionRequest,
     - model (str): model name. Available from /v1/models.
     - prompt (str): the input prompt.
     - suffix (str): The suffix that comes after a completion of inserted text.
-    - max_tokens (int): output token nums
+    - max_tokens (int): output token nums. Default to 16.
     - temperature (float): to modulate the next token probability
     - top_p (float): If set to float < 1, only the smallest set of most
         probable tokens with probabilities that add up to top_p or higher
@@ -562,7 +590,8 @@ async def completions_v1(request: CompletionRequest,
 
     Additional arguments supported by LMDeploy:
     - ignore_eos (bool): indicator for ignoring eos
-    - session_id (int): if not specified, will set random value
+    - skip_special_tokens (bool): Whether or not to remove special tokens
+        in the decoding. Default to be True.
     - top_k (int): The number of the highest probability vocabulary
         tokens to keep for top-k-filtering
 
@@ -571,8 +600,8 @@ async def completions_v1(request: CompletionRequest,
     - presence_penalty (replaced with repetition_penalty)
     - frequency_penalty (replaced with repetition_penalty)
     """
-    if request.session_id == -1:
-        request.session_id = random.randint(1, 10086)
+    VariableInterface.session_id += 1
+    request.session_id = VariableInterface.session_id
     error_check_ret = await check_request(request)
     if error_check_ret is not None:
         return error_check_ret
@@ -591,7 +620,8 @@ async def completions_v1(request: CompletionRequest,
         temperature=request.temperature,
         repetition_penalty=request.repetition_penalty,
         ignore_eos=request.ignore_eos,
-        stop_words=request.stop)
+        stop_words=request.stop,
+        skip_special_tokens=request.skip_special_tokens)
     generators = []
     for i in range(len(request.prompt)):
         result_generator = VariableInterface.async_engine.generate(
@@ -663,7 +693,8 @@ async def completions_v1(request: CompletionRequest,
         async for res in generator:
             if await raw_request.is_disconnected():
                 # Abort the request if the client disconnects.
-                VariableInterface.async_engine.stop_session(request.session_id)
+                await VariableInterface.async_engine.stop_session(
+                    request.session_id)
                 return create_error_response(HTTPStatus.BAD_REQUEST,
                                              'Client disconnected')
             final_res = res
@@ -706,7 +737,7 @@ async def create_embeddings(request: EmbeddingsRequest,
                                  'Unsupported by turbomind.')
 
 
-@app.post('/v1/encode')
+@app.post('/v1/encode', dependencies=[Depends(check_api_key)])
 async def encode(request: EncodeRequest, raw_request: Request = None):
     """Encode prompts.
 
@@ -768,7 +799,8 @@ async def chat_interactive_v1_qos(request: GenerateRequestQos,
     - user_id (str): for qos; if not specified, will set to "default"
     """
     if request.session_id == -1:
-        request.session_id = random.randint(10087, 23333)
+        VariableInterface.session_id += 1
+        request.session_id = VariableInterface.session_id
 
     if VariableInterface.qos_engine is None:
         return create_error_response(
@@ -782,6 +814,8 @@ async def chat_interactive_v1_qos(request: GenerateRequestQos,
         async for out in generation:
             chunk = GenerateResponse(text=out.response,
                                      tokens=out.generate_token_len,
+                                     input_tokens=out.input_token_len,
+                                     history_tokens=out.history_token_len,
                                      finish_reason=out.finish_reason)
             data = chunk.model_dump_json()
             yield f'{data}\n'
@@ -797,7 +831,8 @@ async def chat_interactive_v1_qos(request: GenerateRequestQos,
         async for out in generation:
             if await raw_request.is_disconnected():
                 # Abort the request if the client disconnects.
-                VariableInterface.qos_engine.stop_session(request.session_id)
+                await VariableInterface.qos_engine.stop_session(
+                    request.session_id)
                 return create_error_response(HTTPStatus.BAD_REQUEST,
                                              'Client disconnected')
             text += out.response
@@ -807,10 +842,7 @@ async def chat_interactive_v1_qos(request: GenerateRequestQos,
         return JSONResponse(ret)
 
 
-@app.post('/generate',
-          tags=['deprecated'],
-          description='please use /v1/chat/interactive')
-@app.post('/v1/chat/interactive')
+@app.post('/v1/chat/interactive', dependencies=[Depends(check_api_key)])
 async def chat_interactive_v1(request: GenerateRequest,
                               raw_request: Request = None):
     """Generate completion for the request.
@@ -829,7 +861,8 @@ async def chat_interactive_v1(request: GenerateRequest,
     - stream: whether to stream the results or not.
     - stop (str | List[str] | None): To stop generating further
         tokens. Only accept stop words that's encoded to one token idex.
-    - request_output_len (int): output token nums
+    - request_output_len (int): output token nums. If not specified, will use
+        maximum possible number for a session.
     - top_p (float): If set to float < 1, only the smallest set of most
         probable tokens with probabilities that add up to top_p or higher
         are kept for generation.
@@ -839,12 +872,27 @@ async def chat_interactive_v1(request: GenerateRequest,
     - repetition_penalty (float): The parameter for repetition penalty.
         1.0 means no penalty
     - ignore_eos (bool): indicator for ignoring eos
+    - skip_special_tokens (bool): Whether or not to remove special tokens
+        in the decoding. Default to be True.
     """
-    if request.cancel and request.session_id != -1:
-        VariableInterface.async_engine.stop_session(request.session_id)
-        return {'text': '', 'tokens': 0, 'finish_reason': None}
+    if request.cancel:
+        if request.session_id != -1:
+            await VariableInterface.async_engine.stop_session(
+                request.session_id)
+            return {
+                'text': '',
+                'tokens': 0,
+                'input_tokens': 0,
+                'history_tokens': 0,
+                'finish_reason': 'stop'
+            }
+        else:
+            return create_error_response(
+                HTTPStatus.BAD_REQUEST,
+                'please set a session_id to cancel a request')
     if request.session_id == -1:
-        request.session_id = random.randint(10087, 23333)
+        VariableInterface.session_id += 1
+        request.session_id = VariableInterface.session_id
 
     async_engine = VariableInterface.async_engine
     sequence_start = async_engine.id2step.get(str(request.session_id), 0) == 0
@@ -859,7 +907,8 @@ async def chat_interactive_v1(request: GenerateRequest,
         temperature=request.temperature,
         repetition_penalty=request.repetition_penalty,
         ignore_eos=request.ignore_eos,
-        stop_words=request.stop)
+        stop_words=request.stop,
+        skip_special_tokens=request.skip_special_tokens)
     generation = async_engine.generate(
         request.prompt,
         request.session_id,
@@ -873,6 +922,8 @@ async def chat_interactive_v1(request: GenerateRequest,
         async for out in generation:
             chunk = GenerateResponse(text=out.response,
                                      tokens=out.generate_token_len,
+                                     input_tokens=out.input_token_len,
+                                     history_tokens=out.history_token_len,
                                      finish_reason=out.finish_reason)
             data = chunk.model_dump_json()
             yield f'{data}\n'
@@ -883,18 +934,26 @@ async def chat_interactive_v1(request: GenerateRequest,
     else:
         ret = {}
         text = ''
-        tokens = 0
+        tokens, input_tokens, history_tokens = 0, 0, 0
         finish_reason = None
         async for out in generation:
             if await raw_request.is_disconnected():
                 # Abort the request if the client disconnects.
-                async_engine.stop_session(request.session_id)
+                await async_engine.stop_session(request.session_id)
                 return create_error_response(HTTPStatus.BAD_REQUEST,
                                              'Client disconnected')
             text += out.response
             tokens = out.generate_token_len
+            input_tokens = out.input_token_len
+            history_tokens = out.history_token_len
             finish_reason = out.finish_reason
-        ret = {'text': text, 'tokens': tokens, 'finish_reason': finish_reason}
+        ret = {
+            'text': text,
+            'tokens': tokens,
+            'input_tokens': input_tokens,
+            'history_tokens': history_tokens,
+            'finish_reason': finish_reason
+        }
         return JSONResponse(ret)
 
 
@@ -912,6 +971,8 @@ def serve(model_path: str,
           allow_methods: List[str] = ['*'],
           allow_headers: List[str] = ['*'],
           log_level: str = 'ERROR',
+          api_keys: Optional[Union[List[str], str]] = None,
+          ssl: bool = False,
           qos_config_path: str = '',
           **kwargs):
     """An example to perform model inference through the command line
@@ -947,9 +1008,15 @@ def serve(model_path: str,
         allow_methods (List[str]): a list of allowed HTTP methods for CORS
         allow_headers (List[str]): a list of allowed HTTP headers for CORS
         log_level(str): set log level whose value among [CRITICAL, ERROR, WARNING, INFO, DEBUG]
+        api_keys (List[str] | str | None): Optional list of API keys. Accepts string type as
+            a single api_key. Default to None, which means no api key applied.
+        ssl (bool): Enable SSL. Requires OS Environment variables 'SSL_KEYFILE' and 'SSL_CERTFILE'.
         qos_config_path (str): qos policy config path
     """ # noqa E501
-    os.environ['TM_LOG_LEVEL'] = log_level
+    if os.getenv('TM_LOG_LEVEL') is None:
+        os.environ['TM_LOG_LEVEL'] = log_level
+    logger = get_logger('lmdeploy')
+    logger.setLevel(log_level)
 
     if allow_origins:
         app.add_middleware(
@@ -959,7 +1026,19 @@ def serve(model_path: str,
             allow_methods=allow_methods,
             allow_headers=allow_headers,
         )
-    VariableInterface.async_engine = AsyncEngine(
+    if api_keys is not None:
+        if isinstance(api_keys, str):
+            api_keys = api_keys.split(',')
+        VariableInterface.api_keys = api_keys
+    ssl_keyfile, ssl_certfile, http_or_https = None, None, 'http'
+    if ssl:
+        ssl_keyfile = os.environ['SSL_KEYFILE']
+        ssl_certfile = os.environ['SSL_CERTFILE']
+        http_or_https = 'https'
+
+    pipeline_type, pipeline_class = get_task(model_path)
+
+    VariableInterface.async_engine = pipeline_class(
         model_path=model_path,
         model_name=model_name,
         backend=backend,
@@ -979,11 +1058,23 @@ def serve(model_path: str,
                 VariableInterface.qos_engine.start()
         except FileNotFoundError:
             VariableInterface.qos_engine = None
+    else:
+        # hide qos functions if not applied
+        for i in range(len(app.router.routes)):
+            if 'qos' in app.router.routes[i].path:
+                app.router.routes[i].include_in_schema = False
 
     for i in range(3):
-        print(f'HINT:    Please open \033[93m\033[1mhttp://{server_name}:'
-              f'{server_port}\033[0m in a browser for detailed api usage!!!')
-    uvicorn.run(app=app, host=server_name, port=server_port, log_level='info')
+        print(
+            f'HINT:    Please open \033[93m\033[1m{http_or_https}://'
+            f'{server_name}:{server_port}\033[0m in a browser for detailed api'
+            ' usage!!!')
+    uvicorn.run(app=app,
+                host=server_name,
+                port=server_port,
+                log_level='info',
+                ssl_keyfile=ssl_keyfile,
+                ssl_certfile=ssl_certfile)
 
 
 if __name__ == '__main__':

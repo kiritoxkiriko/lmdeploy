@@ -17,6 +17,7 @@ class SubCliServe:
 
     @staticmethod
     def add_parser_gradio():
+        """Add parser for gradio command."""
         parser = SubCliServe.subparsers.add_parser(
             'gradio',
             formatter_class=DefaultsAndTypesHelpFormatter,
@@ -42,7 +43,8 @@ class SubCliServe:
         ArgumentHelper.backend(parser)
 
         # chat template args
-        ArgumentHelper.meta_instruction(parser)
+        ArgumentHelper.meta_instruction(parser)  # TODO remove
+        ArgumentHelper.chat_template(parser)
         ArgumentHelper.cap(parser)
 
         # pytorch engine args
@@ -52,6 +54,7 @@ class SubCliServe:
         model_name_act = ArgumentHelper.model_name(pt_group)
         session_len_act = ArgumentHelper.session_len(pt_group)
         max_batch_size_act = ArgumentHelper.max_batch_size(pt_group)
+        cache_max_entry_act = ArgumentHelper.cache_max_entry_count(pt_group)
 
         # turbomind args
         tb_group = parser.add_argument_group('TurboMind engine arguments')
@@ -60,13 +63,14 @@ class SubCliServe:
         tb_group._group_actions.append(model_name_act)
         tb_group._group_actions.append(session_len_act)
         tb_group._group_actions.append(max_batch_size_act)
+        tb_group._group_actions.append(cache_max_entry_act)
         ArgumentHelper.model_format(tb_group)
         ArgumentHelper.quant_policy(tb_group)
         ArgumentHelper.rope_scaling_factor(tb_group)
-        ArgumentHelper.cache_max_entry_count(tb_group)
 
     @staticmethod
     def add_parser_api_server():
+        """Add parser for api_server command."""
         parser = SubCliServe.subparsers.add_parser(
             'api_server',
             formatter_class=DefaultsAndTypesHelpFormatter,
@@ -119,9 +123,12 @@ class SubCliServe:
         # common args
         ArgumentHelper.backend(parser)
         ArgumentHelper.log_level(parser)
+        ArgumentHelper.api_keys(parser)
+        ArgumentHelper.ssl(parser)
 
         # chat template args
-        ArgumentHelper.meta_instruction(parser)
+        ArgumentHelper.meta_instruction(parser)  # TODO remove
+        ArgumentHelper.chat_template(parser)
         ArgumentHelper.cap(parser)
 
         # pytorch engine args
@@ -131,6 +138,7 @@ class SubCliServe:
         model_name_act = ArgumentHelper.model_name(pt_group)
         session_len_act = ArgumentHelper.session_len(pt_group)
         max_batch_size_act = ArgumentHelper.max_batch_size(pt_group)
+        cache_max_entry_act = ArgumentHelper.cache_max_entry_count(pt_group)
 
         # turbomind args
         tb_group = parser.add_argument_group('TurboMind engine arguments')
@@ -139,13 +147,14 @@ class SubCliServe:
         tb_group._group_actions.append(model_name_act)
         tb_group._group_actions.append(session_len_act)
         tb_group._group_actions.append(max_batch_size_act)
+        tb_group._group_actions.append(cache_max_entry_act)
         ArgumentHelper.model_format(tb_group)
         ArgumentHelper.quant_policy(tb_group)
         ArgumentHelper.rope_scaling_factor(tb_group)
-        ArgumentHelper.cache_max_entry_count(tb_group)
 
     @staticmethod
     def add_parser_api_client():
+        """Add parser for api_client command."""
         parser = SubCliServe.subparsers.add_parser(
             'api_client',
             formatter_class=DefaultsAndTypesHelpFormatter,
@@ -155,10 +164,16 @@ class SubCliServe:
         parser.add_argument('api_server_url',
                             type=str,
                             help='The URL of api server')
+        parser.add_argument('--api-key',
+                            type=str,
+                            default=None,
+                            help='api key. Default to None, which means no '
+                            'api key will be used')
         ArgumentHelper.session_id(parser)
 
     @staticmethod
     def add_parser_triton_client():
+        """Add parser for triton_client command."""
         parser = SubCliServe.subparsers.add_parser(
             'triton_client',
             formatter_class=DefaultsAndTypesHelpFormatter,
@@ -176,17 +191,24 @@ class SubCliServe:
     @staticmethod
     def gradio(args):
         """Serve LLMs with web UI using gradio."""
+        from lmdeploy.archs import autoget_backend
+        from lmdeploy.messages import (PytorchEngineConfig,
+                                       TurbomindEngineConfig)
         from lmdeploy.model import ChatTemplateConfig
         from lmdeploy.serve.gradio.app import run
-        if args.backend == 'pytorch':
-            from lmdeploy.messages import PytorchEngineConfig
+        backend = args.backend
+
+        if backend != 'pytorch' and ':' not in args.model_path_or_server:
+            # set auto backend mode
+            backend = autoget_backend(args.model_path_or_server)
+        if backend == 'pytorch':
             backend_config = PytorchEngineConfig(
                 tp=args.tp,
                 model_name=args.model_name,
                 max_batch_size=args.max_batch_size,
+                cache_max_entry_count=args.cache_max_entry_count,
                 session_len=args.session_len)
         else:
-            from lmdeploy.messages import TurbomindEngineConfig
             backend_config = TurbomindEngineConfig(
                 model_name=args.model_name,
                 tp=args.tp,
@@ -200,24 +222,34 @@ class SubCliServe:
             model_name=args.model_name,
             meta_instruction=args.meta_instruction,
             capability=args.cap)
+        if args.chat_template:
+            chat_template_config = ChatTemplateConfig.from_json(
+                args.chat_template)
         run(args.model_path_or_server,
             server_name=args.server_name,
             server_port=args.server_port,
-            backend=args.backend,
+            backend=backend,
             backend_config=backend_config,
             chat_template_config=chat_template_config)
 
     @staticmethod
     def api_server(args):
         """Serve LLMs with restful api using fastapi."""
+        from lmdeploy.archs import autoget_backend
         from lmdeploy.model import ChatTemplateConfig
         from lmdeploy.serve.openai.api_server import serve as run_api_server
-        if args.backend == 'pytorch':
+        backend = args.backend
+        if backend != 'pytorch':
+            # set auto backend mode
+            backend = autoget_backend(args.model_path)
+
+        if backend == 'pytorch':
             from lmdeploy.messages import PytorchEngineConfig
             backend_config = PytorchEngineConfig(
                 tp=args.tp,
                 model_name=args.model_name,
                 max_batch_size=args.max_batch_size,
+                cache_max_entry_count=args.cache_max_entry_count,
                 session_len=args.session_len)
         else:
             from lmdeploy.messages import TurbomindEngineConfig
@@ -234,8 +266,11 @@ class SubCliServe:
             model_name=args.model_name,
             meta_instruction=args.meta_instruction,
             capability=args.cap)
+        if args.chat_template:
+            chat_template_config = ChatTemplateConfig.from_json(
+                args.chat_template)
         run_api_server(args.model_path,
-                       backend=args.backend,
+                       backend=backend,
                        backend_config=backend_config,
                        chat_template_config=chat_template_config,
                        server_name=args.server_name,
@@ -245,6 +280,8 @@ class SubCliServe:
                        allow_methods=args.allow_methods,
                        allow_headers=args.allow_headers,
                        log_level=args.log_level.upper(),
+                       api_keys=args.api_keys,
+                       ssl=args.ssl,
                        qos_config_path=args.qos_config_path)
 
     @staticmethod
