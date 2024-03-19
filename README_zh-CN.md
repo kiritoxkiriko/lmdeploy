@@ -1,20 +1,23 @@
 <div align="center">
   <img src="docs/en/_static/image/lmdeploy-logo.svg" width="450"/>
 
-[![docs](https://img.shields.io/badge/docs-latest-blue)](https://lmdeploy.readthedocs.io/zh-cn/latest/)
-[![badge](https://github.com/InternLM/lmdeploy/workflows/lint/badge.svg)](https://github.com/InternLM/lmdeploy/actions)
 [![PyPI](https://img.shields.io/pypi/v/lmdeploy)](https://pypi.org/project/lmdeploy)
+![PyPI - Downloads](https://img.shields.io/pypi/dm/lmdeploy)
 [![license](https://img.shields.io/github/license/InternLM/lmdeploy.svg)](https://github.com/InternLM/lmdeploy/tree/main/LICENSE)
 [![issue resolution](https://img.shields.io/github/issues-closed-raw/InternLM/lmdeploy)](https://github.com/InternLM/lmdeploy/issues)
 [![open issues](https://img.shields.io/github/issues-raw/InternLM/lmdeploy)](https://github.com/InternLM/lmdeploy/issues)
 
+[📘Documentation](https://lmdeploy.readthedocs.io/zh-cn/latest/) |
+[🛠️Quick Start](https://lmdeploy.readthedocs.io/zh-cn/latest/get_started.html) |
+[🤔Reporting Issues](https://github.com/InternLM/lmdeploy/issues/new/choose)
+
 [English](README.md) | 简体中文
 
-</div>
+👋 join us on [![Static Badge](https://img.shields.io/badge/-grey?style=social&logo=wechat&label=WeChat)](https://r.vansin.top/?r=internwx)
+[![Static Badge](https://img.shields.io/badge/-grey?style=social&logo=twitter&label=Twitter)](https://twitter.com/intern_lm)
+[![Static Badge](https://img.shields.io/badge/-grey?style=social&logo=discord&label=Discord)](https://discord.gg/xa29JuW87d)
 
-<p align="center">
-    👋 join us on <a href="https://twitter.com/intern_lm" target="_blank">Twitter</a>, <a href="https://discord.gg/xa29JuW87d" target="_blank">Discord</a> and <a href="https://r.vansin.top/?r=internwx" target="_blank">WeChat</a>
-</p>
+</div>
 
 ______________________________________________________________________
 
@@ -23,7 +26,9 @@ ______________________________________________________________________
 <details open>
 <summary><b>2024</b></summary>
 
-- \[2024/01\] [OpenAOE](https://github.com/InternLM/OpenAOE) 发布，支持无缝接入[LMDeploy Serving Service](./docs/zh_cn/serving/restful_api.md)
+- \[2024/03\] 支持视觉-语言模型（VLM）的离线推理 pipeline 和推理服务
+- \[2024/02\] 支持 Qwen 1.5、Gemma、Mistral、Mixtral、Deepseek-MOE 等模型
+- \[2024/01\] [OpenAOE](https://github.com/InternLM/OpenAOE) 发布，支持无缝接入[LMDeploy Serving Service](./docs/zh_cn/serving/api_server.md)
 - \[2024/01\] 支持多模型、多机、多卡推理服务。使用方法请参考[此处](./docs/zh_cn/serving/proxy_server.md)
 - \[2024/01\] 增加 [PyTorch 推理引擎](./docs/zh_cn/inference/pytorch.md)，作为 TurboMind 引擎的补充。帮助降低开发门槛，和快速实验新特性、新技术
 
@@ -146,14 +151,16 @@ print(response)
 为了帮助用户更进一步了解 LMDeploy，我们准备了用户指南和进阶指南，请阅读我们的[文档](https://lmdeploy.readthedocs.io/zh-cn/latest/)：
 
 - 用户指南
-  - [推理pipeline](./docs/zh_cn/inference/pipeline.md)
-  - [推理引擎 - TurboMind](./docs/zh_cn/inference/turbomind.md)
-  - [推理引擎 - PyTorch](./docs/zh_cn/inference/pytorch.md)
-  - [推理服务](./docs/zh_cn/serving/restful_api.md)
+  - [LLM 推理 pipeline](./docs/zh_cn/inference/pipeline.md)
+  - [VLM 推理 pipeline](./docs/zh_cn/inference/vl_pipeline.md)
+  - [LLM 推理服务](./docs/zh_cn/serving/api_server.md)
+  - [VLM 推理服务](./docs/zh_cn/serving/api_server_vl.md)
   - [模型量化](./docs/zh_cn/quantization)
 - 进阶指南
-  - 增加对话模板
-  - 支持新模型
+  - [推理引擎 - TurboMind](./docs/zh_cn/inference/turbomind.md)
+  - [推理引擎 - PyTorch](./docs/zh_cn/inference/pytorch.md)
+  - [自定义对话模板](./docs/zh_cn/advance/chat_template.md)
+  - [支持新模型](./docs/zh_cn/advance/pytorch_new_model.md)
   - gemm tuning
   - [长文本推理](./docs/zh_cn/advance/long_context.md)
   - [多模型推理服务](./docs/zh_cn/serving/proxy_server.md)

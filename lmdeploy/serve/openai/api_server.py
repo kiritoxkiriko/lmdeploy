@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security.http import HTTPAuthorizationCredentials, HTTPBearer
 
+from lmdeploy.archs import get_task
 from lmdeploy.messages import (GenerationConfig, PytorchEngineConfig,
                                TurbomindEngineConfig)
 from lmdeploy.model import ChatTemplateConfig
@@ -25,6 +26,7 @@ from lmdeploy.serve.openai.protocol import (  # noqa: E501
     GenerateRequest, GenerateRequestQos, GenerateResponse, ModelCard,
     ModelList, ModelPermission, UsageInfo)
 from lmdeploy.serve.qos_engine.qos_engine import QosEngine
+from lmdeploy.utils import get_logger
 
 import logging
 
@@ -1051,6 +1053,8 @@ def serve(model_path: str,
     """ # noqa E501
     if os.getenv('TM_LOG_LEVEL') is None:
         os.environ['TM_LOG_LEVEL'] = log_level
+    logger = get_logger('lmdeploy')
+    logger.setLevel(log_level)
 
     if allow_origins:
         app.add_middleware(
@@ -1070,7 +1074,9 @@ def serve(model_path: str,
         ssl_certfile = os.environ['SSL_CERTFILE']
         http_or_https = 'https'
 
-    VariableInterface.async_engine = AsyncEngine(
+    pipeline_type, pipeline_class = get_task(model_path)
+
+    VariableInterface.async_engine = pipeline_class(
         model_path=model_path,
         model_name=model_name,
         backend=backend,
@@ -1090,6 +1096,11 @@ def serve(model_path: str,
                 VariableInterface.qos_engine.start()
         except FileNotFoundError:
             VariableInterface.qos_engine = None
+    else:
+        # hide qos functions if not applied
+        for i in range(len(app.router.routes)):
+            if 'qos' in app.router.routes[i].path:
+                app.router.routes[i].include_in_schema = False
 
     for i in range(3):
         print(

@@ -54,9 +54,23 @@ def _update_cache_config(model_config: ModelConfig,
         cache_config (CacheConfig): The config of the cache info.
         gpu_id (int): The GPU id to use.
     """
-    torch.cuda.empty_cache()
-    gpu_mem_physical_free, _ = get_gpu_memory(gpu_id)
-    gpu_mem = gpu_mem_physical_free * cache_config.cache_max_entry_count
+
+    def __get_free_gpu_mem_size():
+        """get free gpu memory size."""
+        torch.cuda.empty_cache()
+        gpu_mem_physical_free, _ = get_gpu_memory(gpu_id)
+        logger.debug(f'device<{gpu_id}> free gpu memory:'
+                     f' {gpu_mem_physical_free>>20} mb')
+        vocal_size = model_config.vocab_size
+        max_prefill_token_num = cache_config.max_prefill_token_num
+        # lm_head output(2) + to float(4) + estimated misc(1) = 7
+        intermediate_cache_size = int(max_prefill_token_num * vocal_size * 7)
+        logger.debug('estimated max runtime memory:'
+                     f' {intermediate_cache_size>>20} mb')
+        gpu_mem_physical_free -= intermediate_cache_size
+        return gpu_mem_physical_free * cache_config.cache_max_entry_count
+
+    gpu_mem = __get_free_gpu_mem_size()
     cpu_mem = host_mem_size
     cache_block_size = CacheEngine.get_cache_block_size(
         cache_config.block_size, model_config, world_size)
@@ -190,8 +204,9 @@ class StepContext:
     q_start_loc: torch.LongTensor
     history_lengths: torch.LongTensor
     q_seq_length: torch.LongTensor
-    max_seq_length: int
     kv_seq_length: torch.LongTensor
+    max_q_seq_length: int
+    max_kv_seq_length: int
     kv_caches: List
     is_decoding: bool
     world_size: int = 1
@@ -221,7 +236,7 @@ class StepContext:
         """
 
         position_ids = inputs.position_ids
-        max_seq_length = position_ids.size(-1)
+        max_q_seq_length = position_ids.size(-1)
 
         # seq_len + history_length
         kv_seq_length = position_ids[..., -1] + 1
@@ -231,6 +246,8 @@ class StepContext:
         position_ids_1d = cls.get_position_ids_1d(position_ids, q_seq_length,
                                                   device)
 
+        max_kv_seq_length = max_q_seq_length + max(inputs.history_lengths)
+
         ret = StepContext(inputs=inputs,
                           block_offsets=inputs.block_offsets,
                           position_ids=inputs.position_ids,
@@ -238,8 +255,9 @@ class StepContext:
                           q_start_loc=inputs.q_start_loc,
                           history_lengths=inputs.history_lengths,
                           q_seq_length=inputs.seq_length,
-                          max_seq_length=max_seq_length,
                           kv_seq_length=kv_seq_length,
+                          max_q_seq_length=max_q_seq_length,
+                          max_kv_seq_length=max_kv_seq_length,
                           kv_caches=kv_caches,
                           is_decoding=inputs.is_decoding,
                           world_size=world_size,
