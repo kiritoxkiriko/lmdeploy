@@ -8,4 +8,9 @@ RUN pip install --no-cache-dir prometheus_fastapi_instrumentator
 
 ENV ENABLE_METRICS=1
 
-COPY ./lmdeploy/serve/openai/api_server.py /usr/local/lib/python3.8/dist-packages/lmdeploy/serve/openai/api_server.py
+ARG LMDEPLOY_PATH
+
+COPY ./lmdeploy/serve/openai/api_server.py /tmp/api_server.py
+
+# add custom api_server.py to lmdeploy package dynamically by copying it to the package directory
+RUN mv /tmp/api_server.py $(pip show lmdeploy | grep Location | awk '{print $2}')/lmdeploy/serve/openai/api_server.py
