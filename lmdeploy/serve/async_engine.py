@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 from lmdeploy.messages import (EngineGenerationConfig, GenerationConfig,
                                PytorchEngineConfig, Response,
                                TurbomindEngineConfig)
-from lmdeploy.model import ChatTemplateConfig, best_match_model
+from lmdeploy.model import MODELS, ChatTemplateConfig, best_match_model
 from lmdeploy.tokenizer import DetokenizeState
 from lmdeploy.utils import _stop_words, get_logger
 
@@ -270,6 +270,7 @@ class AsyncEngine:
                  repetition_penalty: float = 1.0,
                  ignore_eos: bool = False,
                  do_preprocess: bool = True,
+                 adapter_name: Optional[str] = None,
                  **kwargs):
         """Inference a batch of prompts.
 
@@ -293,6 +294,8 @@ class AsyncEngine:
             ignore_eos (bool): indicator for ignoring eos
             do_preprocess (bool): whether pre-process the messages. Default to
                 True, which means chat_template will be applied.
+            adapter_name (str): the adapter name of slora for pytorch backend.
+                Pick one from adapters. Default to None, using the base model.
         """
         if gen_config is None:
             gen_config = GenerationConfig(
@@ -305,6 +308,7 @@ class AsyncEngine:
         return self.batch_infer(prompts,
                                 gen_config=gen_config,
                                 do_preprocess=do_preprocess,
+                                adapter_name=adapter_name,
                                 **kwargs)
 
     async def stop_session(self, session_id: int):
@@ -354,6 +358,7 @@ class AsyncEngine:
                     gen_config: Optional[Union[GenerationConfig,
                                                EngineGenerationConfig]] = None,
                     do_preprocess: bool = True,
+                    adapter_name: Optional[str] = None,
                     **kwargs):
         """Inference a batch of prompts.
 
@@ -365,6 +370,8 @@ class AsyncEngine:
                 GenerationConfig. Default to None.
             do_preprocess (bool): whether pre-process the messages. Default to
                 True, which means chat_template will be applied.
+            adapter_name (str): the adapter name of slora for pytorch backend.
+                Pick one from adapters. Default to None, using the base model.
         """
         need_list_wrap = isinstance(prompts, str) or isinstance(
             prompts[0], Dict)
@@ -392,6 +399,7 @@ class AsyncEngine:
                                   sequence_start=True,
                                   sequence_end=True,
                                   do_preprocess=do_preprocess,
+                                  adapter_name=adapter_name,
                                   **kwargs))
 
             async def _inner_call(i, generator):
@@ -417,6 +425,7 @@ class AsyncEngine:
             gen_config: Optional[Union[GenerationConfig,
                                        EngineGenerationConfig]] = None,
             do_preprocess: bool = True,
+            adapter_name: Optional[str] = None,
             **kwargs):
         """Inference a batch of prompts with stream mode.
 
@@ -428,6 +437,8 @@ class AsyncEngine:
                 GenerationConfig. Default to None.
             do_preprocess (bool): whether pre-process the messages. Default to
                 True, which means chat_template will be applied.
+            adapter_name (str): the adapter name of slora for pytorch backend.
+                Pick one from adapters. Default to None, using the base model.
         """
         need_list_wrap = isinstance(prompts, str) or isinstance(
             prompts[0], Dict)
@@ -456,6 +467,7 @@ class AsyncEngine:
                                   sequence_start=True,
                                   sequence_end=True,
                                   do_preprocess=do_preprocess,
+                                  adapter_name=adapter_name,
                                   **kwargs))
 
             async def _inner_call(i, generator):
@@ -488,9 +500,13 @@ class AsyncEngine:
             proc.join()
 
     async def _get_prompt_input(self, prompt: str, do_preprocess: bool,
-                                sequence_start: bool):
+                                sequence_start: bool, adapter_name: str):
         if do_preprocess:
-            prompt = self.chat_template.messages2prompt(prompt, sequence_start)
+            # use adapter's chat template if possible
+            chat_template = self.chat_template
+            if adapter_name in MODELS.module_dict:
+                chat_template = MODELS.module_dict[adapter_name]()
+            prompt = chat_template.messages2prompt(prompt, sequence_start)
         input_ids = self.tokenizer.encode(prompt, add_bos=sequence_start)
         return {'prompt': prompt, 'input_ids': input_ids}
 
@@ -505,6 +521,7 @@ class AsyncEngine:
             sequence_end: bool = True,  # no interactive mode by default
             step: int = 0,
             do_preprocess: bool = True,
+            adapter_name: Optional[str] = None,
             **kwargs):
         """Generate responses.
 
@@ -537,9 +554,9 @@ class AsyncEngine:
         prompt = messages
 
         prompt_input = await self._get_prompt_input(prompt, do_preprocess,
-                                                    sequence_start)
+                                                    sequence_start,
+                                                    adapter_name)
         prompt = prompt_input['prompt']
-        logger.info(f'Prompt with applied chat template:\n{prompt}')
         input_ids = prompt_input['input_ids']
         if gen_config.max_new_tokens is None:
             # for interactive endpoint, will try maximum possible token num
@@ -547,6 +564,10 @@ class AsyncEngine:
                 128, self.session_len - self.id2step[str(session_id)] -
                 len(input_ids))
         finish_reason = None
+        logger.info(f'prompt={prompt!r}, '
+                    f'gen_config={gen_config}, '
+                    f'prompt_token_id={input_ids}, '
+                    f'adapter_name={adapter_name}.')
         logger.info(f'session_id={session_id}, '
                     f'history_tokens={self.id2step[str(session_id)]}, '
                     f'input_tokens={len(input_ids)}, '
@@ -569,6 +590,7 @@ class AsyncEngine:
                         session_id=session_id,
                         **prompt_input,
                         gen_config=gen_config,
+                        adapter_name=adapter_name,
                         stream_output=stream_response,
                         sequence_start=sequence_start,
                         sequence_end=sequence_end,
