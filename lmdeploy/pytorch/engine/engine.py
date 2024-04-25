@@ -194,8 +194,6 @@ class Engine:
         max_batches = self.scheduler_config.max_batches
 
         # buffers to create inputs
-        self._q_start_loc_buf = torch.arange(max_batches)
-        self._attention_mask_buf = torch.ones(max_batches, 1, dtype=torch.long)
         self._seq_length_buf = torch.ones(max_batches, dtype=torch.long)
 
     def _bind_request_manager(self):
@@ -322,7 +320,6 @@ class Engine:
         return self.tp
 
     @logging_timer('CreateModelInputs', logger)
-    @torch.inference_mode()
     def create_model_inputs(self, messages: SeqList, adapters: AdapterList):
         """create model inputs from messages.
 
@@ -331,6 +328,7 @@ class Engine:
             adapters (AdapterList): Adapters.
         """
         history_lengths = [msg.history_len for msg in messages]
+        history_lengths = torch.tensor(history_lengths)
 
         token_ids = [msg.token_ids for msg in messages]
 
@@ -346,19 +344,10 @@ class Engine:
         if not is_decoding:
             seq_length = [len(tokens) for tokens in token_ids]
             seq_length = torch.tensor(seq_length, dtype=torch.long)
-            max_seq_len = max(seq_length)
-            q_start_loc = seq_length.cumsum(0) - seq_length
-            mask_range = torch.arange(max_seq_len)[None, :]
-            attention_mask = (mask_range < seq_length[:, None]).long()
-            position_ids = attention_mask.long().cumsum(-1) - 1
-            position_ids += position_ids.new_tensor(history_lengths).unsqueeze(
-                -1)
         else:
-            q_start_loc = self._q_start_loc_buf[:batch_size]
-            attention_mask = self._attention_mask_buf[:batch_size]
             seq_length = self._seq_length_buf[:batch_size]
-            position_ids = q_start_loc.new_tensor(history_lengths).unsqueeze(
-                -1)
+        max_q_seq_length = seq_length.max().item()
+        max_history_length = history_lengths.max().item()
 
         # TODO: get block offsets is slow when block_size = 1
         block_offsets = self.scheduler.get_block_tables(messages)
@@ -386,11 +375,10 @@ class Engine:
         num_ignored_history = torch.tensor(num_ignored_history)
         return ModelInputs(input_ids=input_ids,
                            seq_length=seq_length,
-                           attention_mask=attention_mask,
-                           block_offsets=block_offsets,
-                           position_ids=position_ids,
-                           q_start_loc=q_start_loc,
                            history_lengths=history_lengths,
+                           block_offsets=block_offsets,
+                           max_q_seq_length=max_q_seq_length,
+                           max_history_length=max_history_length,
                            is_decoding=is_decoding,
                            num_ignored_history=num_ignored_history,
                            local_adapter_ids=local_adapter_ids,
@@ -403,21 +391,18 @@ class Engine:
                                  stop_words: torch.Tensor,
                                  num_appendable_ids: torch.Tensor):
         """batched stopping criteria."""
-        with torch.inference_mode(), torch.cuda.stream(self.stream):
-            num_appendable_ids = num_appendable_ids - 1
-            stopped = num_appendable_ids <= 0
-            if stop_words is not None:
-                sw_stopped = (token_ids[:, None] == stop_words).any(1)
-                stopped = stopped | sw_stopped
-        self.stream.synchronize()
+        num_appendable_ids = num_appendable_ids - 1
+        stopped = num_appendable_ids <= 0
+        if stop_words is not None:
+            sw_stopped = (token_ids[:, None] == stop_words).any(1)
+            stopped = stopped | sw_stopped
         return stopped, num_appendable_ids
 
     @logging_timer('SamplingLogits', logger)
-    async def async_sampling_logits(self, logits: torch.Tensor,
-                                    history_ids: torch.Tensor,
-                                    sampling_inputs: SamplingInputs,
-                                    inputs: ModelInputs,
-                                    ignore_eos: torch.Tensor):
+    def async_sampling_logits(self, logits: torch.Tensor,
+                              history_ids: torch.Tensor,
+                              sampling_inputs: SamplingInputs,
+                              inputs: ModelInputs, ignore_eos: torch.Tensor):
         """sampling logits."""
 
         def __get_last_logits():
@@ -431,10 +416,8 @@ class Engine:
 
         split_logits = __get_last_logits().cuda()
         logits_processor = FusedLogitsProcessor(sampling_inputs, ignore_eos)
-        with torch.inference_mode(), torch.cuda.stream(self.stream):
-            logits = logits_processor(history_ids, split_logits)
-            next_token_ids = logits_processor.sampling(logits)
-        self.stream.synchronize()
+        logits = logits_processor(history_ids, split_logits)
+        next_token_ids = logits_processor.sampling(logits)
         next_token_ids = next_token_ids
 
         return next_token_ids
@@ -524,7 +507,6 @@ class Engine:
         else:
             return await __long_context_single_forward(inputs)
 
-    @torch.inference_mode()
     def _make_infer_outputs(self, next_token_ids: torch.LongTensor,
                             logits: torch.Tensor, stopped: torch.Tensor):
         """make infer output."""
@@ -535,11 +517,21 @@ class Engine:
                 return []
             return [token.item()]
 
+        def __get_q_start_loc():
+            inputs = self._inputs
+            seq_length = inputs.seq_length
+            batch_size = len(seq_length)
+            if inputs.is_decoding:
+                return torch.arange(0, batch_size)
+            else:
+                return seq_length.cumsum(0) - seq_length
+
         running = self._running
         is_run = [seq.status == MessageStatus.RUNNING for seq in running]
         self.update_running(running, next_token_ids, stopped)
 
         # generate output
+        q_start_loc = __get_q_start_loc()
         outputs: Dict[int, InferOutput] = dict()
         for idx, msg in enumerate(running):
             if not is_run[idx]:
@@ -556,12 +548,11 @@ class Engine:
 
             if msg.return_logits:
                 inputs = self._inputs
-                start = inputs.q_start_loc[idx]
+                start = q_start_loc[idx]
                 seqlen = inputs.seq_length[idx]
                 outputs[session_id].logits = logits[start:start + seqlen]
         return outputs
 
-    @torch.inference_mode()
     async def _async_step_background(
             self, inputs: ModelInputs, swap_in_map: Dict, swap_out_map: Dict,
             history_ids: torch.Tensor, sampling_inputs: SamplingInputs,
@@ -595,22 +586,21 @@ class Engine:
 
         for idx in range(loop_count):
             # inference
-            with torch.inference_mode():
-                output = await self._async_model_forward(
-                    inputs, swap_in_map=swap_in_map, swap_out_map=swap_out_map)
-                logits = output['logits']
-                logits = logits[0]  # [bs, seq, prob] -> [seq, prob]
+            output = await self._async_model_forward(inputs,
+                                                     swap_in_map=swap_in_map,
+                                                     swap_out_map=swap_out_map)
+            logits = output['logits']
+            logits = logits[0]  # [bs, seq, prob] -> [seq, prob]
 
-                # sampling
-                next_token_ids = await self.async_sampling_logits(
-                    logits, history_ids, sampling_inputs, inputs,
-                    num_ignore_eos > 0)
-                num_ignore_eos = num_ignore_eos - 1
+            # sampling
+            next_token_ids = self.async_sampling_logits(
+                logits, history_ids, sampling_inputs, inputs,
+                num_ignore_eos > 0)
+            num_ignore_eos = num_ignore_eos - 1
 
-                # stopping criteria
-                stopped, num_appendable_ids = self._batch_stopping_criteria(
-                    next_token_ids, sampling_inputs.stop_words,
-                    num_appendable_ids)
+            # stopping criteria
+            stopped, num_appendable_ids = self._batch_stopping_criteria(
+                next_token_ids, sampling_inputs.stop_words, num_appendable_ids)
 
             # send output
             stopped = stopped.cpu()
@@ -627,6 +617,7 @@ class Engine:
                 swap_out_map = dict()
                 __update_inputs(next_token_ids)
 
+    @torch.inference_mode()
     async def _async_loop_background(self, in_que: asyncio.Queue,
                                      out_que: asyncio.Queue):
         """async loop background."""
@@ -684,21 +675,24 @@ class Engine:
 
                 self._running = running
                 self._inputs = inputs
-                await self._async_step_background(
-                    inputs=inputs,
-                    swap_in_map=schedule_output.swap_in_map,
-                    swap_out_map=schedule_output.swap_out_map,
-                    history_ids=history_ids,
-                    sampling_inputs=sampling_inputs,
-                    num_appendable_ids=num_appendable_ids,
-                    num_ignore_eos=num_ignore_eos,
-                    output_que=out_que,
-                )
+
+                with torch.cuda.stream(self.stream):
+                    await self._async_step_background(
+                        inputs=inputs,
+                        swap_in_map=schedule_output.swap_in_map,
+                        swap_out_map=schedule_output.swap_out_map,
+                        history_ids=history_ids,
+                        sampling_inputs=sampling_inputs,
+                        num_appendable_ids=num_appendable_ids,
+                        num_ignore_eos=num_ignore_eos,
+                        output_que=out_que,
+                    )
             except Exception as e:
                 out_que.put_nowait((True, e))
             finally:
                 in_que.task_done()
 
+    @torch.inference_mode()
     async def async_loop(self):
         """Main loop of the engine.
 

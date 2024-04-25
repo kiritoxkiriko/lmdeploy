@@ -119,6 +119,15 @@ class YiVLChatTemplateWrapper(VLChatTemplateWrapper):
     pass
 
 
+class InternVLChatTemplateWrapper(VLChatTemplateWrapper):
+    """InternVL chat template."""
+
+    def append_image_token(self, prompt, num_images: int):
+        """append image tokens to user prompt."""
+        # not sure whether support multi images.
+        return f'<img>{IMAGE_TOKEN}</img>\n' * num_images + prompt
+
+
 class DeepSeekVLChatTemplateWrapper(VLChatTemplateWrapper):
     """DeepSeek vl chat template."""
 
@@ -145,6 +154,26 @@ class QwenVLChatTemplateWrapper(VLChatTemplateWrapper):
         return res
 
 
+class InternLMXComposer2TemplateWrapper(VLChatTemplateWrapper):
+    """InternLM-XComposer2 chat template."""
+
+    def append_image_token(self, prompt, num_images: int):
+        return ' '.join([IMAGE_TOKEN] * num_images) + prompt
+
+
+class MiniGeminiLlamaTempateWrapper(VLChatTemplateWrapper):
+    """Qwen vl chat template."""
+
+    def append_image_token(self, prompt, num_images: int):
+        """append image tokens to user prompt."""
+        if num_images == 0:
+            return prompt
+        res = f'{IMAGE_TOKEN}\n'
+        assert num_images <= 1, 'MiniGeminiLlama accepts 1 input image'
+        res = res + prompt
+        return res
+
+
 def get_vl_prompt_template(model_path: str, chat_template: BaseModel,
                            model_name: str) -> VLChatTemplateWrapper:
     """get vision language prompt template."""
@@ -159,4 +188,10 @@ def get_vl_prompt_template(model_path: str, chat_template: BaseModel,
         return LlavaVLChatTemplateWrapper(chat_template)
     elif arch == 'MultiModalityCausalLM':  # deepseek-vl
         return DeepSeekVLChatTemplateWrapper(chat_template)
+    elif arch in ['InternLMXComposer2ForCausalLM', 'InternLM2ForCausalLM']:
+        return InternLMXComposer2TemplateWrapper(chat_template)
+    elif arch == 'InternVLChatModel':
+        return InternVLChatTemplateWrapper(chat_template)
+    elif arch == 'MiniGeminiLlamaForCausalLM':
+        return MiniGeminiLlamaTempateWrapper(chat_template)
     raise ValueError(f'unsupported vl_prompt_template with arch {arch}')

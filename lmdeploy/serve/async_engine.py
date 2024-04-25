@@ -49,7 +49,7 @@ def deduce_a_name(
 
     backend_config_model_name = _config_model_name(backend_config)
     chat_template_config_model_name = _config_model_name(chat_template_config)
-    model_name = model_name or chat_template_config_model_name or backend_config_model_name  # noqa
+    model_name = model_name or backend_config_model_name or chat_template_config_model_name  # noqa
     if model_name is None:
         # model maybe from workspace for turbomind
         model_name = get_model_name_from_workspace_model(model_path)
@@ -72,6 +72,8 @@ class GenOut:
     input_token_len: int
     generate_token_len: int
     finish_reason: Optional[Literal['stop', 'length']] = None
+    token_ids: List[int] = None
+    logprobs: List[Dict[int, float]] = None
 
 
 class Session:
@@ -123,6 +125,18 @@ class Session:
         return res
 
 
+def _get_event_loop():
+    """get event loop."""
+    try:
+        event_loop = asyncio.get_event_loop()
+    except Exception:
+        logger.warning('Can not found event loop in current thread.'
+                       ' Create a new event loop.')
+        event_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(event_loop)
+    return event_loop
+
+
 class AsyncEngine:
     """Async inference engine. Maintaining a bunch of tm_model instances.
 
@@ -168,10 +182,14 @@ class AsyncEngine:
         self.model_name = deduce_a_name(model_path, model_name, backend_config,
                                         chat_template_config)
         # build chat template config
+        if self.model_name in MODELS.module_dict.keys():
+            chat_template_name = self.model_name
+        else:
+            chat_template_name = best_match_model(model_path)
         if chat_template_config is None:
-            chat_template_config = ChatTemplateConfig(self.model_name)
+            chat_template_config = ChatTemplateConfig(chat_template_name)
         elif chat_template_config.model_name is None:
-            chat_template_config.model_name = self.model_name
+            chat_template_config.model_name = chat_template_name
         self.chat_template = chat_template_config.chat_template
 
         # prevent bc
@@ -210,7 +228,6 @@ class AsyncEngine:
         self.tokenizer = self.engine.tokenizer
         self.id2step = {}
         self.id2generator = {}
-        self.loop = asyncio.get_event_loop()
         self.running_session_ids = set()
         self.gens_set = set()
         for i in range(self.instance_num):
@@ -408,6 +425,12 @@ class AsyncEngine:
                     outputs[i + j].generate_token_len = out.generate_token_len
                     outputs[i + j].input_token_len = out.input_token_len
                     outputs[i + j].finish_reason = out.finish_reason
+                    if out.token_ids:
+                        outputs[i + j].token_ids.extend(out.token_ids)
+                    if out.logprobs:
+                        if outputs[i + j].logprobs is None:
+                            outputs[i + j].logprobs = []
+                        outputs[i + j].logprobs.extend(out.logprobs)
 
             async def gather():
                 await asyncio.gather(*[
@@ -415,7 +438,7 @@ class AsyncEngine:
                     for i in range(len(batch_prompts))
                 ])
 
-            self.loop.run_until_complete(gather())
+            _get_event_loop().run_until_complete(gather())
         outputs = outputs[0] if need_list_wrap else outputs
         return outputs
 
@@ -474,8 +497,8 @@ class AsyncEngine:
                 async for out in generator:
                     outputs.put(
                         Response(out.response, out.generate_token_len,
-                                 out.input_token_len, i + j,
-                                 out.finish_reason))
+                                 out.input_token_len, i + j, out.finish_reason,
+                                 out.token_ids, out.logprobs))
 
             async def gather():
                 await asyncio.gather(*[
@@ -485,7 +508,7 @@ class AsyncEngine:
                 outputs.put(None)
 
             proc = Thread(
-                target=lambda: self.loop.run_until_complete(gather()))
+                target=lambda: _get_event_loop().run_until_complete(gather()))
             proc.start()
 
             while True:
@@ -595,16 +618,27 @@ class AsyncEngine:
                         sequence_start=sequence_start,
                         sequence_end=sequence_end,
                         step=self.id2step[str(session_id)]):
-                    _, res, tokens = outputs
                     # decode res
+                    res, tokens = outputs.token_ids, outputs.num_token
+                    if len(res) <= state.ids_offset:
+                        continue
+
+                    ids_offset = state.ids_offset
                     response, state = self.tokenizer.detokenize_incrementally(
                         res,
                         state,
                         skip_special_tokens=gen_config.skip_special_tokens)
+
+                    res = res[ids_offset:]
+                    logprobs = None
+                    if outputs.logprobs:
+                        logprobs = outputs.logprobs[ids_offset:]
+
                     # response, history token len,
                     # input token len, gen token len
                     yield GenOut(response, self.id2step[str(session_id)],
-                                 len(input_ids), tokens, finish_reason)
+                                 len(input_ids), tokens, finish_reason, res,
+                                 logprobs)
 
                 finish_reason = 'length' \
                     if tokens >= gen_config.max_new_tokens else 'stop'

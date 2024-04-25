@@ -25,7 +25,7 @@ class TestAutoBackend:
             ('baichuan-inc/Baichuan2-13B-Chat', True, False),
             ('internlm/internlm-chat-7b', True, True),
             ('internlm/internlm2-chat-7b', True, True),
-            ('internlm/internlm-xcomposer2-7b', False, False),
+            ('internlm/internlm-xcomposer2-7b', False, True),
             ('internlm/internlm-xcomposer-7b', False, True),
             ('THUDM/chatglm2-6b', True, False),
             ('THUDM/chatglm3-6b', True, False),
@@ -37,17 +37,18 @@ class TestAutoBackend:
             ('mistralai/Mixtral-8x7B-Instruct-v0.1', True, False),
             ('Qwen/Qwen-7B-Chat', True, True),
             ('Qwen/Qwen-VL-Chat', False, True),
-            ('Qwen/Qwen1.5-4B-Chat', True, False),
+            ('Qwen/Qwen1.5-4B-Chat', True, True),
+            ('Qwen/Qwen1.5-0.5B-Chat', True, False),
         ]
         return models
 
-    def test_pytorch_is_suppored(self, turbomind_workspace, models):
+    def test_pytorch_is_supported(self, turbomind_workspace, models):
         from lmdeploy.pytorch.supported_models import is_supported
         assert is_supported(turbomind_workspace) is False
         for m, flag, _ in models:
             assert is_supported(m) is flag
 
-    def test_turbomind_is_suppored(self, turbomind_workspace, models):
+    def test_turbomind_is_supported(self, turbomind_workspace, models):
         from lmdeploy.turbomind.supported_models import is_supported
         assert is_supported(turbomind_workspace) is True
         for m, _, flag in models:
