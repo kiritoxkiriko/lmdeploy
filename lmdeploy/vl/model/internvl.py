@@ -8,7 +8,7 @@ from transformers import AutoConfig, AutoModel, CLIPImageProcessor
 
 from lmdeploy.utils import get_logger
 from lmdeploy.vl.model.base import VisonModel
-from lmdeploy.vl.model.utils import load_model_from_weight_files
+from lmdeploy.vl.model.utils import disable_logging
 
 logger = get_logger('lmdeploy')
 
@@ -77,9 +77,9 @@ def dynamic_preprocess(image,
 class InternVLVisionModel(VisonModel):
     """InternVL vision model."""
 
-    def __init__(self, model_path, device='cuda:0'):
+    def __init__(self, model_path, with_llm: bool = False):
+        self.with_llm = with_llm
         self.model_path = model_path
-        self.device = device
         self.build_model()
 
     def build_model(self):
@@ -91,21 +91,41 @@ class InternVLVisionModel(VisonModel):
             # transformers below 4.37.0 may raise error about flash_attn
             config.llm_config.attn_implementation = 'eager'
             model = AutoModel.from_config(config, trust_remote_code=True)
-            del model.language_model
+            if not self.with_llm:
+                del model.language_model
+            else:
+                self.vl_model = model
             model.half()
 
-        model.to_empty(device='cpu')
-        load_model_from_weight_files(model, self.model_path)
-        self.model = model
-        self.model.to(self.device).eval()
+        from accelerate import load_checkpoint_and_dispatch
+        with disable_logging():
+            load_checkpoint_and_dispatch(
+                model=model,
+                checkpoint=self.model_path,
+                device_map='auto' if not self.with_llm else {'': 'cpu'},
+                no_split_module_classes=['InternVisionEncoderLayer'],
+                dtype=torch.half)
+
+        # We need eval mode to freeze the weights in model, thus,
+        # avoid randomness in inference.
+        self.model = model.eval()
         self.config = config
 
         if getattr(self.config, 'dynamic_image_size', False):
             logger.info('using InternVL-Chat-V1-5 vision preprocess')
-            MEAN = (123.675, 116.28, 103.53)
-            STD = (58.395, 57.12, 57.375)
+            MEAN = (0.485, 0.456, 0.406)
+            STD = (0.229, 0.224, 0.225)
             import torchvision.transforms as T
-            self.transform = T.Compose([T.Normalize(mean=MEAN, std=STD)])
+            from torchvision.transforms.functional import InterpolationMode
+            input_size = self.config.vision_config.image_size
+            self.transform = T.Compose([
+                T.Lambda(lambda img: img.convert('RGB')
+                         if img.mode != 'RGB' else img),
+                T.Resize((input_size, input_size),
+                         interpolation=InterpolationMode.BICUBIC),
+                T.ToTensor(),
+                T.Normalize(mean=MEAN, std=STD)
+            ])
             self._forward_func = self._forward_v1_5
         else:
             self.image_processor = CLIPImageProcessor.from_pretrained(
@@ -114,7 +134,6 @@ class InternVLVisionModel(VisonModel):
 
     def _preprocess_v1_5(self, images: List[Image]):
         outputs = []
-        import torchvision.transforms.functional as F
         for image in images:
             out = dynamic_preprocess(
                 image,
@@ -122,7 +141,7 @@ class InternVLVisionModel(VisonModel):
                 max_num=self.config.max_dynamic_patch,
                 image_size=self.config.vision_config.image_size,
                 use_thumbnail=self.config.use_thumbnail)
-            out = [F.pil_to_tensor(x).half() for x in out]
+            out = [self.transform(x) for x in out]
             out = torch.stack(out)  # (patch) x c x h x w
             outputs.append(out)
         return outputs
@@ -132,8 +151,7 @@ class InternVLVisionModel(VisonModel):
         outputs = self._preprocess_v1_5(images)
         split = [x.shape[0] for x in outputs]
         outputs = torch.cat(outputs, dim=0)
-        outputs = outputs.to(self.device, dtype=torch.float16)
-        outputs = self.transform(outputs)
+        outputs = outputs.to(self.model.device, dtype=torch.float16)
         outputs = self.model.extract_feature(outputs)
         outputs = torch.split(outputs, split, dim=0)
         outputs = [x.reshape(-1, x.shape[-1]) for x in outputs]
@@ -143,7 +161,7 @@ class InternVLVisionModel(VisonModel):
         """forward for internvl-chat-v1-1, internvl-chat-v1-2."""
         pixel_values = self.image_processor(images=images,
                                             return_tensors='pt').pixel_values
-        pixel_values = pixel_values.to(self.device, dtype=torch.float16)
+        pixel_values = pixel_values.to(self.model.device, dtype=torch.float16)
         outputs = self.model.extract_feature(pixel_values)
         outputs = torch.split(outputs, 1, dim=0)
         outputs = [x.squeeze() for x in outputs]

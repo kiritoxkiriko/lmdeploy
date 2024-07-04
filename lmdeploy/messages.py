@@ -107,7 +107,7 @@ class EngineGenerationConfig(GenerationConfig):
             self.n) == int and self.n > 0, 'n is not a positive integer'
         assert self.top_p > 0 and self.top_p <= 1  # (0, 1]
         assert self.top_k >= 0, 'top_k can not be a negative integer'
-        assert self.temperature >= 0 and self.temperature <= 1  # [0,1]
+        assert self.temperature >= 0 and self.temperature <= 2  # [0,2]
 
 
 @pydantic_dataclass
@@ -116,7 +116,8 @@ class TurbomindEngineConfig:
 
     Args:
         model_name (str): the name of the deployed model, deprecated and has no effect when version > 0.2.1
-        model_format (str): the layout of the deployed model. It can be one of the following values [hf, llama, awq], `hf` meaning `hf_llama`, `llama` meaning `meta_llama`, `awq` meaning the quantized model by AWQ.
+        model_format (str): the layout of the deployed model. It can be one of the following values [hf, meta_llama, awq],
+            `hf` meaning huggingface model(.bin, .safetensors), `meta_llama` being meta llama's format(.pth), awq` meaning the quantized model by AWQ.
         tp (int): the number of GPU cards used in tensor parallelism, default to 1
         session_len (int): the max session length of a sequence, default to None
         max_batch_size (int): the max batch size during inference, default to 128
@@ -124,6 +125,7 @@ class TurbomindEngineConfig:
             For versions of lmdeploy between `v0.2.0` and `v0.2.1`, it defaults to 0.5, depicting the percentage of TOTAL GPU memory to be allocated to the k/v cache.
             For lmdeploy versions greater than `v0.2.1`, it defaults to 0.8, signifying the percentage of FREE GPU memory to be reserved for the k/v cache
         cache_block_seq_len (int): the length of the token sequence in a k/v block, default to 64
+        enable_prefix_caching (bool): enable cache prompts for block reuse, default to False
         quant_policy (int): default to 0. When k/v is quantized into 8 bit, set it to 4
         rope_scaling_factor (int): scaling factor used for dynamic ntk, default to 0. TurboMind follows the implementation of transformer LlamaAttention
         use_logn_attn (bool): whether or not to use log attn: default to False
@@ -141,6 +143,7 @@ class TurbomindEngineConfig:
     max_batch_size: int = 128
     cache_max_entry_count: float = 0.8
     cache_block_seq_len: int = 64
+    enable_prefix_caching: bool = False
     quant_policy: int = 0
     rope_scaling_factor: float = 0.0
     use_logn_attn: bool = False
@@ -175,7 +178,7 @@ class PytorchEngineConfig:
             it defaults to 0.8, signifying the percentage of FREE GPU memory
             to be reserved for the k/v cache
         eviction_type (str): What action to perform when kv cache
-            is full, ['recompute', 'copy'], Default 'recompute'.
+            is full, ['recompute', 'copy'], Deprecated.
         prefill_interval (int): Interval to perform prefill,
             Default 16.
         block_size (int): paging cache block size, default 64.
@@ -186,6 +189,8 @@ class PytorchEngineConfig:
         adapters (dict): The path configs to lora adapters.
         max_prefill_token_num (int): tokens per iteration.
         thread_safe (bool): thread safe engine instance.
+        enable_prefix_caching (bool): Enable token match and sharing caches.
+        device_type (str): The inference device type, options ['cuda']
         download_dir (str): Directory to download and load the weights,
             default to the default cache directory of huggingface.
         revision (str): The specific model version to use.
@@ -205,6 +210,8 @@ class PytorchEngineConfig:
     adapters: Dict[str, str] = None
     max_prefill_token_num: int = 4096
     thread_safe: bool = False
+    enable_prefix_caching: bool = False
+    device_type: str = 'cuda'
     download_dir: str = None
     revision: str = None
 
@@ -218,6 +225,9 @@ class PytorchEngineConfig:
         assert self.num_cpu_blocks >= 0, 'invalid num_cpu_blocks'
         assert self.max_prefill_token_num >= 0, 'invalid max_prefill_token_num'
         assert self.num_gpu_blocks >= 0, 'invalid num_gpu_blocks'
+        assert self.device_type in [
+            'cuda'
+        ], (f'invalid device_type: {self.device_type}')
 
 
 class ResponseType(enum.Enum):
@@ -229,6 +239,7 @@ class ResponseType(enum.Enum):
     SESSION_REPEAT = enum.auto()
     SESSION_NOT_EXIST = enum.auto()
     HANDLER_NOT_EXIST = enum.auto()
+    INPUT_LENGTH_ERROR = enum.auto()
 
 
 @dataclass
@@ -277,3 +288,15 @@ class EngineOutput:
     token_ids: List[int]
     num_token: int
     logprobs: List[Dict[int, float]] = None
+
+
+@dataclass
+class VisionConfig:
+    """Vison model configs.
+
+    Args:
+        max_batch_size (int): the max image size passed to the model, since
+            some models will use image patch, the actual running batch could
+            be larger than this value.
+    """
+    max_batch_size: int = 1

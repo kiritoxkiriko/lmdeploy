@@ -3,7 +3,6 @@ import asyncio
 import dataclasses
 import os
 import random
-from argparse import ArgumentError
 from contextlib import asynccontextmanager
 from itertools import count
 from queue import Empty, Queue
@@ -14,8 +13,9 @@ from lmdeploy.messages import (EngineGenerationConfig, GenerationConfig,
                                PytorchEngineConfig, Response,
                                TurbomindEngineConfig)
 from lmdeploy.model import MODELS, ChatTemplateConfig, best_match_model
+from lmdeploy.serve.utils import LogitsMixin, _get_event_loop
 from lmdeploy.tokenizer import DetokenizeState
-from lmdeploy.utils import _stop_words, get_logger
+from lmdeploy.utils import _get_and_verify_max_len, _stop_words, get_logger
 
 logger = get_logger('lmdeploy')
 
@@ -55,12 +55,7 @@ def deduce_a_name(
         model_name = get_model_name_from_workspace_model(model_path)
     # may get a model name from model_path
     if model_name is None:
-        model_name = best_match_model(model_path)
-        if model_name is None:
-            raise ArgumentError(None,
-                                f'Please set model_name for {model_path}')
-        else:
-            logger.info(f'matched chat template name: {model_name}')
+        model_name = model_path
     return model_name
 
 
@@ -125,19 +120,7 @@ class Session:
         return res
 
 
-def _get_event_loop():
-    """get event loop."""
-    try:
-        event_loop = asyncio.get_event_loop()
-    except Exception:
-        logger.warning('Can not found event loop in current thread.'
-                       ' Create a new event loop.')
-        event_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(event_loop)
-    return event_loop
-
-
-class AsyncEngine:
+class AsyncEngine(LogitsMixin):
     """Async inference engine. Maintaining a bunch of tm_model instances.
 
     Args:
@@ -205,7 +188,6 @@ class AsyncEngine:
         if backend == 'turbomind':
             self._build_turbomind(model_path=model_path,
                                   backend_config=backend_config,
-                                  chat_template_config=chat_template_config,
                                   tp=tp,
                                   **kwargs)
         elif backend == 'pytorch':
@@ -218,7 +200,8 @@ class AsyncEngine:
         logger.info(f'updated backend_config={self.backend_config}')
 
         # parameters for member functions
-        self.session_len = self.backend_config.session_len
+        self.session_len = _get_and_verify_max_len(
+            self.hf_tm_cfg, self.backend_config.session_len)
         self.stop_words = _stop_words(self.chat_template.stop_words,
                                       self.engine.tokenizer)
         if self.stop_words is not None:
@@ -238,7 +221,6 @@ class AsyncEngine:
             model_path: str,
             backend_config: Optional[Union[TurbomindEngineConfig,
                                            PytorchEngineConfig]] = None,
-            chat_template_config: Optional[ChatTemplateConfig] = None,
             tp: int = 1,
             **kwargs):
         """Innter build method for turbomind backend."""
@@ -248,15 +230,11 @@ class AsyncEngine:
         assert isinstance(backend_config, TurbomindEngineConfig), 'Please'\
             ' use TurbomindEngineConfig imported from lmdeploy.messages for ' \
             'turbomind backend'
-        if backend_config.session_len is None:
-            backend_config.session_len = self.chat_template.session_len
         from lmdeploy import turbomind as tm
         self.engine = tm.TurboMind.from_pretrained(
-            model_path,
-            engine_config=backend_config,
-            chat_template_config=chat_template_config,
-            **kwargs)
+            model_path, engine_config=backend_config, **kwargs)
         self.backend_config = backend_config
+        self.hf_tm_cfg = self.engine.config
 
     def _build_pytorch(
             self,
@@ -271,11 +249,10 @@ class AsyncEngine:
         assert isinstance(backend_config, PytorchEngineConfig), 'Please '\
             'use PytorchEngineConfig imported from lmdeploy.messages for ' \
             'pytorch backend'
-        if backend_config.session_len is None:
-            backend_config.session_len = self.chat_template.session_len
         self.engine = Engine(model_path=model_path,
                              engine_config=backend_config)
         self.backend_config = backend_config
+        self.hf_tm_cfg = getattr(self.engine.model_config, 'hf_config', None)
 
     def __call__(self,
                  prompts: Union[List[str], str, List[Dict], List[List[Dict]]],
@@ -353,8 +330,9 @@ class AsyncEngine:
         """A context manager to make sure server's safe running."""
         try:
             yield
-        except (Exception, asyncio.CancelledError) as e:  # noqa
-            await self.stop_session(session_id)
+        except (Exception, asyncio.CancelledError, GeneratorExit) as e:  # noqa
+            # TODO: find out why await would block the coroutine here
+            _get_event_loop().create_task(self.stop_session(session_id))
             raise e
         if str(session_id) in self.id2generator:
             self.gens_set.add(self.id2generator[str(session_id)])
@@ -587,11 +565,6 @@ class AsyncEngine:
                                                     adapter_name)
         prompt = prompt_input['prompt']
         input_ids = prompt_input['input_ids']
-        if gen_config.max_new_tokens is None:
-            # for interactive endpoint, will try maximum possible token num
-            gen_config.max_new_tokens = max(
-                128, self.session_len - self.id2step[str(session_id)] -
-                len(input_ids))
         finish_reason = None
         logger.info(f'prompt={prompt!r}, '
                     f'gen_config={gen_config}, '
@@ -603,18 +576,30 @@ class AsyncEngine:
                     f'max_new_tokens={gen_config.max_new_tokens}, '
                     f'seq_start={sequence_start}, seq_end={sequence_end}, '
                     f'step={step}, prep={do_preprocess}')
+
+        if gen_config.max_new_tokens is None:
+            # for interactive endpoint, will try maximum possible token num
+            gen_config.max_new_tokens = max(
+                128, self.session_len - self.id2step[str(session_id)] -
+                len(input_ids))
+        elif self.id2step[str(session_id)] + len(
+                input_ids) + gen_config.max_new_tokens > self.session_len:
+            gen_config.max_new_tokens = max(
+                self.session_len - self.id2step[str(session_id)] -
+                len(input_ids), 128)
+            logger.error(
+                f'Truncate max_new_tokens to {gen_config.max_new_tokens}')
         if self.id2step[str(session_id)] + len(
                 input_ids) + gen_config.max_new_tokens > self.session_len:
-            logger.warning(f'run out of tokens. session_id={session_id}')
-            finish_reason = 'length'
+            logger.error(f'run out of tokens. session_id={session_id}.')
             yield GenOut('', self.id2step[str(session_id)], len(input_ids), 0,
-                         finish_reason)
+                         'length')
             if sequence_end is True and sequence_start is False:
                 await self.end_session(session_id)
         else:
             generator = await self.get_generator(False, session_id)
             async with self.safe_run(session_id):
-                state = DetokenizeState()
+                state = DetokenizeState(len(input_ids))
                 response = ''
                 async for outputs in generator.async_stream_infer(
                         session_id=session_id,
@@ -626,7 +611,7 @@ class AsyncEngine:
                         sequence_end=sequence_end,
                         step=self.id2step[str(session_id)]):
                     # decode res
-                    res, tokens = outputs.token_ids, outputs.num_token
+                    res, tokens = input_ids + outputs.token_ids, outputs.num_token  # noqa
                     if len(res) <= state.ids_offset:
                         continue
 

@@ -54,7 +54,7 @@ from lmdeploy import pipeline, TurbomindEngineConfig
 
 backend_config = TurbomindEngineConfig(cache_max_entry_count=0.2)
 
-pipe = pipeline('internlm/internlm2-chat-7b',
+pipe = pipeline('internlm/internlm2_5-7b-chat',
                 backend_config=backend_config)
 response = pipe(['Hi, pls intro yourself', 'Shanghai is'])
 print(response)
@@ -64,13 +64,19 @@ print(response)
 
 ```shell
 # chat 命令
-lmdeploy chat internlm/internlm2-chat-7b --cache-max-entry-count 0.2
+lmdeploy chat internlm/internlm2_5-7b-chat --cache-max-entry-count 0.2
 
 # server 命令
-lmdeploy serve api_server internlm/internlm2-chat-7b --cache-max-entry-count 0.2
+lmdeploy serve api_server internlm/internlm2_5-7b-chat --cache-max-entry-count 0.2
 ```
 
 ## 服务
+
+### Api 服务器获取超时
+
+API 服务器的图像 URL 获取超时可通过环境变量 `LMDEPLOY_FETCH_TIMEOUT` 进行配置。默认情况下，请求可能需要长达 10 秒才会超时。
+
+请参阅 [lmdeploy/vl/utils.py](https://github.com/InternLM/lmdeploy/blob/7b6876eafcb842633e0efe8baabe5906d7beeeea/lmdeploy/vl/utils.py#L31) 了解用法。
 
 ## 量化
 

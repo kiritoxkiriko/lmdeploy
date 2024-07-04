@@ -1,45 +1,32 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import asyncio
 import os
-from dataclasses import asdict, dataclass, field
+import warnings
+from dataclasses import dataclass, field, fields
 from datetime import timedelta
 from typing import Any, Callable, Dict, List
 
 import torch
 import torch.distributed as dist
 from torch import multiprocessing as mp
-from transformers import AutoModelForCausalLM
 
 from lmdeploy.pytorch.accel import LoadNoInit
 from lmdeploy.utils import get_logger
 
-from ..adapter.adapter import (AdapterWeightMap, get_indexed_lora_linears,
-                               get_max_lora_weight_size, update_lora_linears)
+from ..adapter.adapter import (AdapterWeightMap, SchedulerAdapter,
+                               get_indexed_lora_linears, get_loralinear_info,
+                               update_lora_linears)
 from ..config import CacheConfig, ModelConfig
-from ..models import patch
+from ..devices import DeviceContext, get_device_manager
+from ..models.patch import patch, update_model
 from ..utils import get_gpu_memory
+from ..weight_loader.model_weight_loader import load_model_weights
 from .cache_engine import CacheEngine
+from .devices import get_current_device_utils
 
 logger = get_logger('lmdeploy')
 
 _PATCH_ARG_NAMES = ['context', 'use_origin']
-
-
-def _infer_block_size(model: torch.nn.Module,
-                      model_config: ModelConfig,
-                      cache_config: CacheConfig,
-                      world_size: int = 1):
-    """infer block size."""
-    max_weight_dim = get_max_lora_weight_size(model)
-    if max_weight_dim == 0:
-        return cache_config.block_size
-
-    per_token_size = model_config.get_head_size(
-    ) * model_config.num_key_value_heads // world_size
-    block_size = 1
-    while block_size * per_token_size < max_weight_dim:
-        block_size *= 2
-    return block_size * world_size
 
 
 def _update_cache_config(model_config: ModelConfig,
@@ -93,6 +80,21 @@ def _update_cache_config(model_config: ModelConfig,
                      f' {runtime_cache_size>>20} mb')
         return gpu_mem_physical_free * cache_config.cache_max_entry_count
 
+    def __adjust_block_size():
+        """adjust block_size."""
+        # TODO: support kernel with both large head dim and large block size.
+        if model_config.k_head_dim >= 512 and cache_config.block_size > 32:
+            cache_config.block_size = 32
+            rank = 0
+            if dist.is_initialized():
+                rank = dist.get_rank()
+            if rank == 0:
+                logger.warning(
+                    f'Update `block_size={cache_config.block_size}`'
+                    f' for large `head_dim={model_config.k_head_dim}`.')
+
+    __adjust_block_size()
+
     cache_block_size = CacheEngine.get_cache_block_size(
         cache_config.block_size, model_config, world_size)
     gpu_mem = __get_free_gpu_mem_size(cache_block_size)
@@ -111,6 +113,134 @@ def _update_cache_config(model_config: ModelConfig,
 
 
 @dataclass
+class AdapterInfo:
+    ranks: torch.LongTensor
+    scalings: torch.Tensor
+    rank_offsets: torch.LongTensor
+    target_modules: List[str]
+    max_rank_per_target: List[int]
+    max_rank: int
+
+    @classmethod
+    def from_adapters(cls, adapters: List[SchedulerAdapter]):
+        """from adapters."""
+        if len(adapters) == 0:
+            return None
+        target_modules = adapters[0].target_modules
+        max_rank = adapters[0].max_rank
+        ranks = [ada.rank for ada in adapters]
+        scalings = [ada.scaling for ada in adapters]
+        rank_offsets = [torch.from_numpy(ada.rank_offset) for ada in adapters]
+        ranks = torch.tensor(ranks)
+        scalings = torch.tensor(scalings)
+        rank_offsets = torch.stack(rank_offsets)
+        max_rank_per_target = ranks.max(0)[0].tolist()
+
+        return cls(
+            ranks=ranks,
+            scalings=scalings,
+            rank_offsets=rank_offsets,
+            target_modules=target_modules,
+            max_rank=max_rank,
+            max_rank_per_target=max_rank_per_target,
+        )
+
+    def split_by_targets(self):
+        """split by targets."""
+        ret = dict()
+        max_rank = self.max_rank
+        for idx, target in enumerate(self.target_modules):
+            r = self.ranks[:, idx]
+            scaling = self.scalings[:, idx]
+            r_off_start = idx * max_rank
+            r_off_end = r_off_start + max_rank
+            rank_offset = self.rank_offsets[:, r_off_start:r_off_end]
+            max_rank_per_target = [self.max_rank_per_target[idx]]
+            ret[target] = AdapterInfo(
+                r,
+                scaling,
+                rank_offset,
+                target_modules=[target],
+                max_rank=max_rank_per_target[0],
+                max_rank_per_target=max_rank_per_target,
+            )
+        return ret
+
+    def to_device(self, device: str):
+        """to device."""
+        out_dict = dict()
+        for f in fields(self):
+            k = f.name
+            v = getattr(self, k)
+            if isinstance(v, torch.Tensor):
+                v = v.to(device)
+            out_dict[k] = v
+
+        return AdapterInfo(**out_dict)
+
+
+@dataclass
+class VisionModelInputs:
+    """Vision model inputs."""
+    history_lengths: torch.LongTensor = None
+    history_image_nums: torch.LongTensor = None
+    history_image_token_lengths: torch.LongTensor = None
+    input_embeddings: List[List[torch.Tensor]] = None
+    input_embedding_ranges: List[torch.LongTensor] = None
+    input_embedding_indexing: torch.BoolTensor = None
+
+    def to_device(self, device: str):
+        """to device."""
+        out_dict = dict()
+        for f in fields(self):
+            k = f.name
+            v = getattr(self, k)
+            if isinstance(v, torch.Tensor):
+                v = v.to(device)
+            elif k == 'input_embedding_ranges' and v is not None:
+                v = [e.to(device) for e in v]
+            elif k == 'input_embeddings' and v is not None:
+                v = [[e.to(device) for e in li] for li in v]
+            out_dict[k] = v
+
+        return VisionModelInputs(**out_dict)
+
+    def get_inputs(self, history_lengths: torch.Tensor,
+                   seq_lengths: torch.Tensor):
+        """get vision embedding inputs."""
+        input_embeddings = None
+        input_embedding_indexing = None
+        if self.input_embeddings is not None and len(
+                self.input_embeddings) > 0:
+            input_embedding_li = []
+            for (his_len, seq_len, embeddings,
+                 emb_ranges) in zip(history_lengths, seq_lengths,
+                                    self.input_embeddings,
+                                    self.input_embedding_ranges):
+                for emb, (emb_start, emb_end) in zip(embeddings, emb_ranges):
+                    start = max(emb_start, his_len) - emb_start
+                    end = min(emb_end, his_len + seq_len) - emb_start
+                    if 0 <= start < end:
+                        input_embedding_li.append(emb[start:end])
+            # has embeddings
+            if len(input_embedding_li) > 0:
+                input_embeddings = torch.cat(input_embedding_li, dim=0)
+                device = input_embeddings.device
+                starts = history_lengths - self.history_lengths
+                ends = starts + seq_lengths
+                input_embedding_indexing = torch.cat([
+                    indexing[s:e] for indexing, s, e in zip(
+                        self.input_embedding_indexing, starts, ends)
+                ],
+                                                     dim=0)
+                index_ranges = torch.arange(input_embedding_indexing.numel(),
+                                            device=device)
+                input_embedding_indexing = index_ranges[
+                    input_embedding_indexing]
+        return input_embeddings, input_embedding_indexing
+
+
+@dataclass
 class ModelInputs:
     """Input of the model."""
     input_ids: torch.LongTensor
@@ -122,10 +252,9 @@ class ModelInputs:
     is_decoding: bool
     num_ignored_history: torch.LongTensor
     local_adapter_ids: torch.LongTensor = None
-    global_adapter_ids: torch.LongTensor = None
-    adapter_offsets: torch.LongTensor = None
-    max_rank: int = 0
+    adapter_info: AdapterInfo = None
     meta: Any = None
+    vision_inputs: VisionModelInputs = None
 
     def update(self, input_ids: torch.LongTensor):
         """update input ids."""
@@ -160,25 +289,20 @@ class ModelInputs:
             if overlap:
                 block_end += 1
 
-            local_adapter_ids = self.local_adapter_ids
-            if local_adapter_ids is not None:
-                local_adapter_ids = local_adapter_ids[:, start:end]
-
-            block_offsets = self.block_offsets[:, :block_end]
+            block_offsets = self.block_offsets
             inp = ModelInputs(
                 input_ids=self.input_ids[:, start:end],
                 seq_length=input_ids.new_tensor([end - start]),
                 block_offsets=block_offsets,
                 history_lengths=self.history_lengths + start,
-                max_q_seq_length=input_ids.new_tensor(end - start),
+                max_q_seq_length=end - start,
                 max_history_length=self.max_history_length + start,
                 is_decoding=self.is_decoding,
                 num_ignored_history=self.num_ignored_history,
-                local_adapter_ids=local_adapter_ids,
-                global_adapter_ids=self.global_adapter_ids,
-                adapter_offsets=self.adapter_offsets,
-                max_rank=self.max_rank,
+                local_adapter_ids=self.local_adapter_ids,
+                adapter_info=self.adapter_info,
                 meta=self.meta,
+                vision_inputs=self.vision_inputs,
             )
             ret.append(inp)
             block_start += num_blocks
@@ -187,11 +311,16 @@ class ModelInputs:
 
     def to_device(self, device: str):
         """to device."""
-        input_dict = asdict(self)
         out_dict = dict()
-        for k, v in input_dict.items():
+        for f in fields(self):
+            k = f.name
+            v = getattr(self, k)
             if isinstance(v, torch.Tensor):
                 v = v.to(device)
+            elif isinstance(v, VisionModelInputs):
+                v = v.to_device(device)
+            elif isinstance(v, AdapterInfo):
+                v = v.to_device(device)
             out_dict[k] = v
 
         return ModelInputs(**out_dict)
@@ -218,11 +347,10 @@ class StepContext:
     kv_caches: List
     is_decoding: bool
     world_size: int = 1
-    json_config: Dict = None
     local_adapter_ids: torch.LongTensor = None
-    global_adapter_ids: torch.LongTensor = None
-    adapter_offsets: torch.LongTensor = None
-    max_rank: int = 0
+    adapter_params: Dict[str, AdapterInfo] = None
+    input_embeddings: torch.Tensor = None
+    input_embedding_indexing: torch.Tensor = None
 
     _outputs: Dict = field(default_factory=dict)
 
@@ -232,7 +360,6 @@ class StepContext:
         inputs: ModelInputs,
         world_size: int = 1,
         device: str = 'cuda',
-        json_config: dict = None,
         kv_caches: List = None,
         cache_config: CacheConfig = None,
     ):
@@ -246,6 +373,14 @@ class StepContext:
         q_seq_length = inputs.seq_length
         max_q_seq_length = inputs.max_q_seq_length
         history_lengths = inputs.history_lengths
+
+        # for vlm
+        input_embeddings, input_embedding_indexing = None, None
+        if (inputs.vision_inputs is not None
+                and inputs.vision_inputs.input_embeddings is not None):
+            input_embeddings, input_embedding_indexing = \
+                inputs.vision_inputs.get_inputs(history_lengths, q_seq_length)
+
         batch_size = len(q_seq_length)
         device = q_seq_length.device
 
@@ -264,7 +399,6 @@ class StepContext:
         # position ids 1d
         position_ids_1d = cls.get_position_ids_1d(position_ids, q_seq_length,
                                                   device)
-
         # seq_len + history_length
         kv_seq_length = q_seq_length + history_lengths
         max_kv_seq_length = max_q_seq_length + inputs.max_history_length
@@ -273,10 +407,16 @@ class StepContext:
         if window_size > 0:
             kv_seq_length -= inputs.num_ignored_history
 
+        adapter_params = None
+        if inputs.adapter_info is not None:
+            adapter_params = inputs.adapter_info.split_by_targets()
+
         ret = StepContext(inputs=inputs,
                           block_offsets=inputs.block_offsets,
                           position_ids=position_ids,
                           position_ids_1d=position_ids_1d,
+                          input_embeddings=input_embeddings,
+                          input_embedding_indexing=input_embedding_indexing,
                           attention_mask=attention_mask,
                           q_start_loc=q_start_loc,
                           history_lengths=inputs.history_lengths,
@@ -287,11 +427,10 @@ class StepContext:
                           kv_caches=kv_caches,
                           is_decoding=inputs.is_decoding,
                           world_size=world_size,
-                          json_config=json_config,
                           local_adapter_ids=inputs.local_adapter_ids,
-                          global_adapter_ids=inputs.global_adapter_ids,
-                          adapter_offsets=inputs.adapter_offsets,
-                          max_rank=inputs.max_rank)
+                          adapter_params=adapter_params)
+
+        ret = get_current_device_utils().update_step_context(ret)
         return ret
 
     @classmethod
@@ -300,7 +439,7 @@ class StepContext:
                             seq_length: torch.LongTensor,
                             device: str = 'cuda'):
         """get 1d position_ids."""
-        if position_ids.size(1) == 1:
+        if position_ids.size(0) == 1 or position_ids.size(1) == 1:
             position_ids_1d = position_ids.flatten()
         else:
             position_ids_1d = [
@@ -341,7 +480,6 @@ def model_forward(
     patched_model: torch.nn.Module,
     inputs: ModelInputs,
     cache_engine: CacheEngine,
-    json_config: dict = None,
     world_size: int = 1,
     stream: torch.cuda.Stream = None,
 ):
@@ -353,7 +491,6 @@ def model_forward(
         context = StepContext.new(
             inputs=inputs,
             world_size=world_size,
-            json_config=json_config,
             kv_caches=cache_engine.gpu_cache,
             cache_config=cache_engine.cache_config,
         )
@@ -392,6 +529,25 @@ def _add_adapters(hf_model: torch.nn.Module, adapters: Dict[str, str]):
         inject_adapter_in_model(config, model=hf_model, adapter_name=name)
 
 
+def _remove_unused_modules(hf_model: torch.nn.Module, model_cfg: ModelConfig):
+    """remove unused modules."""
+    if model_cfg.unused_modules is not None and len(
+            model_cfg.unused_modules) > 0:
+        for mod in model_cfg.unused_modules:
+            has_mod = True
+            parts = mod.split('.')
+            mod_path = 'hf_model'
+            for p in parts:
+                if eval(f'hasattr({mod_path}, "{p}")'):
+                    mod_path = f'{mod_path}.{p}'
+                else:
+                    has_mod = False
+                    break
+            if has_mod:
+                exec(f'del {mod_path}')
+    return hf_model
+
+
 def _unparam_lora_weight(model: torch.nn.Module):
     """unparam lora weight.
 
@@ -424,6 +580,14 @@ class AutoModelAgent:
     def __init__(self, model_config: ModelConfig, cache_config: CacheConfig):
         self.model_config = model_config
         self.cache_config = cache_config
+
+    def get_loralinear_info(self):
+        """get lora linear info."""
+        raise NotImplementedError('Not implemented')
+
+    def get_block_numel(self):
+        """get block nelement."""
+        raise NotImplementedError('Not implemented')
 
     def paging_adapters(self, weight_maps: List[AdapterWeightMap]):
         """paging adapter."""
@@ -493,11 +657,6 @@ class BaseModelAgent(AutoModelAgent):
             adapters=adapters,
             trust_remote_code=trust_remote_code)
 
-        block_size = _infer_block_size(self.patched_model, model_config,
-                                       cache_config)
-        if block_size != cache_config.block_size:
-            cache_config.block_size = block_size
-            logger.warning(f'infered block size: {block_size}')
         _update_cache_config(model_config, cache_config)
 
         self.cache_engine = CacheEngine(cache_config, model_config)
@@ -509,25 +668,39 @@ class BaseModelAgent(AutoModelAgent):
                      adapters: Dict[str, str] = None,
                      trust_remote_code: bool = True):
         """build patched model."""
-        with LoadNoInit():
-            hf_model = AutoModelForCausalLM.from_pretrained(
+        device = 'cuda'
+        with LoadNoInit(), warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            hf_model = self.model_config.auto_model_cls.from_pretrained(
                 model_path,
                 torch_dtype=torch_dtype,
+                device_map=device,
                 trust_remote_code=trust_remote_code,
                 **self.model_config.init_kwargs)
             hf_model.eval()
             hf_model.config.use_cache = True
+            # build for vlm model
+            _remove_unused_modules(hf_model, self.model_config)
 
         if adapters:
             _load_adapters(hf_model, adapters)
 
         patched_model = patch(hf_model, _PATCH_ARG_NAMES)
+        update_model(patched_model)
 
         if adapters:
             _unparam_lora_weight(patched_model)
 
-        patched_model = patched_model.cuda()
         return patched_model
+
+    def get_loralinear_info(self):
+        """get lora linear info."""
+        return get_loralinear_info(self.patched_model)
+
+    def get_block_numel(self):
+        """get block nelement."""
+        k_cache = self.cache_engine.local_gpu_cache[0][0]
+        return k_cache[0].numel()
 
     def paging_adapters(self, weight_maps: List[AdapterWeightMap]):
         """paging adapter."""
@@ -551,7 +724,6 @@ class BaseModelAgent(AutoModelAgent):
             self.patched_model,
             inputs,
             self.cache_engine,
-            self.model_config.json_config,
             world_size=1,
             stream=self.stream,
         )
@@ -634,35 +806,6 @@ def _tp_build_model(
     patched_model = None
     cache_engine = None
 
-    def __get_device_map(model, device_map=None):
-        """get device map of model."""
-        import psutil
-        model_size = _get_model_memory_usage(model)
-        if psutil.virtual_memory().available < model_size:
-            logger.debug('Preload model on GPU.')
-            return device_map
-        else:
-            logger.debug('Preload model on CPU.')
-            return 'cpu'
-
-    def __load_params_and_buffers(param_mod, mod):
-        """load param and buffer."""
-        for name, param in param_mod.named_parameters(recurse=False):
-            mod.register_parameter(name, param)
-        for name, buffer in param_mod.named_buffers(recurse=False):
-            mod.register_buffer(name, buffer)
-
-    def __load_state_dict_assign(param_model, model):
-        """load state dict assign."""
-        try:
-            model.load_state_dict(param_model.state_dict(), assign=True)
-        except Exception:
-            __load_params_and_buffers(param_model, model)
-            mods = dict(model.named_modules())
-            for mod_name, param_mod in param_model.named_modules():
-                mod = mods[mod_name]
-                __load_params_and_buffers(param_mod, mod)
-
     def _broadcast_config(cache_config):
         """broadcast cache config, use minimum cache."""
         if rank == 0:
@@ -690,34 +833,24 @@ def _tp_build_model(
         config = model_config.hf_config
         torch_dtype = model_config.dtype
         device_map = None
-        with init_empty_weights():
-            model = AutoModelForCausalLM.from_config(
+        with init_empty_weights(), warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            model = model_config.auto_model_cls.from_config(
                 config,
                 torch_dtype=torch_dtype,
                 trust_remote_code=trust_remote_code,
                 **model_config.init_kwargs)
+            # build for vlm model
+            _remove_unused_modules(model, model_config)
             if rank == 0:
                 device_map = _create_device_map(model, world_size)
             _add_adapters(model, adapters)
             if rank == 0:
                 # adapter would remove weight of linear.
                 device_map = _create_device_map(model, world_size, device_map)
+
         model.eval()
         model.config.use_cache = True
-
-        if rank == 0:
-            with LoadNoInit():
-                device_map = __get_device_map(model, device_map)
-                param_model = AutoModelForCausalLM.from_pretrained(
-                    model_path,
-                    torch_dtype=torch_dtype,
-                    device_map=device_map,
-                    trust_remote_code=trust_remote_code,
-                    **model_config.init_kwargs)
-                _load_adapters(param_model, adapters, device_map=device_map)
-                __load_state_dict_assign(param_model, model)
-                param_model = param_model.to('meta')
-                del param_model
 
         patched_model = patch(
             model,
@@ -725,13 +858,16 @@ def _tp_build_model(
             rank=rank,
             world_size=world_size,
         )
+        load_model_weights(patched_model,
+                           model_path,
+                           adapters,
+                           rank=rank,
+                           world_size=world_size,
+                           device='cuda')
+        if rank == 0:
+            logger.debug('Updating model.')
+        update_model(patched_model)
 
-        block_size = _infer_block_size(patched_model, model_config,
-                                       cache_config, world_size)
-        if block_size != cache_config.block_size:
-            cache_config.block_size = block_size
-            if rank == 0:
-                logger.warning(f'infered block size: {block_size}')
         _update_cache_config(model_config,
                              cache_config,
                              gpu_id=rank,
@@ -846,7 +982,6 @@ def _tp_model_loop(
             patched_model,
             inputs,
             cache_engine,
-            model_config.json_config,
             world_size=world_size,
             stream=stream,
         )
@@ -855,6 +990,7 @@ def _tp_model_loop(
 def _start_tp_process(proc_id: int,
                       world_size: int,
                       func: Callable,
+                      device_context: DeviceContext,
                       args: List = None,
                       kwargs: Dict = None):
     """Start the tensor parallel process.
@@ -872,7 +1008,9 @@ def _start_tp_process(proc_id: int,
                                 rank=rank,
                                 world_size=world_size,
                                 timeout=timedelta(days=35600))
-        with torch.cuda.device(rank), torch.inference_mode():
+        torch.cuda.set_device(rank)
+        with get_device_manager().context(
+                device_context), torch.inference_mode():
             args = args or tuple()
             kwargs = kwargs or dict()
             func(rank, *args, **kwargs)
@@ -980,11 +1118,13 @@ class TPModelAgent(AutoModelAgent):
         port = os.environ['MASTER_PORT']
         logger.info(f'MASTER_ADDR={addr}, MASTER_PORT={port}')
 
+        device_context = get_device_manager().current_context()
         self.mp_context = mp.spawn(
             _start_tp_process,
             args=(
                 world_size,
                 _tp_model_loop,
+                device_context,
                 (model_path, ),
                 dict(model_config=model_config,
                      cache_config=cache_config,
@@ -1037,6 +1177,15 @@ class TPModelAgent(AutoModelAgent):
 
         return model, cache_engine, cache_config
 
+    def get_loralinear_info(self):
+        """get lora linear info."""
+        return get_loralinear_info(self.patched_model)
+
+    def get_block_numel(self):
+        """get block nelement."""
+        k_cache = self.cache_engine.local_gpu_cache[0][0]
+        return k_cache[0].numel()
+
     def paging_adapters(self, weight_maps: List[AdapterWeightMap]):
         """load adapter."""
         if not weight_maps:
@@ -1060,7 +1209,6 @@ class TPModelAgent(AutoModelAgent):
             self.patched_model,
             inputs,
             self.cache_engine,
-            self.model_config.json_config,
             world_size=1,
             stream=self.stream,
         )

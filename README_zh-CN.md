@@ -26,6 +26,9 @@ ______________________________________________________________________
 <details open>
 <summary><b>2024</b></summary>
 
+- \[2024/06\] PyTorch engine 支持了 DeepSeek-V2 和若干 VLM 模型推理, 比如 CogVLM2，Mini-InternVL，LlaVA-Next
+- \[2024/05\] 在多 GPU 上部署 VLM 模型时，支持把视觉部分的模型均分到多卡上
+- \[2024/05\] 支持InternVL v1.5, LLaVa, InternLMXComposer2 等 VLMs 模型的 4bit 权重量化和推理
 - \[2024/04\] 支持 Llama3 和 InternVL v1.1, v1.2，MiniGemini，InternLM-XComposer2 等 VLM 模型
 - \[2024/04\] TurboMind 支持 kv cache int4/int8 在线量化和推理，适用已支持的所有型号显卡。详情请参考[这里](docs/zh_cn/quantization/kv_quant.md)
 - \[2024/04\] TurboMind 引擎升级，优化 GQA 推理。[internlm2-20b](https://huggingface.co/internlm/internlm2-20b) 推理速度达 16+ RPS，约是 vLLM 的 1.8 倍
@@ -107,32 +110,39 @@ LMDeploy TurboMind 引擎拥有卓越的推理能力，在各种规模的模型�
   <li>Llama3 (8B, 70B)</li>
   <li>InternLM (7B - 20B)</li>
   <li>InternLM2 (7B - 20B)</li>
+  <li>InternLM2.5 (7B)</li>
   <li>QWen (1.8B - 72B)</li>
   <li>QWen1.5 (0.5B - 110B)</li>
   <li>QWen1.5 - MoE (0.5B - 72B)</li>
+  <li>QWen2 (0.5B - 72B)</li>
   <li>Baichuan (7B)</li>
   <li>Baichuan2 (7B-13B)</li>
   <li>Code Llama (7B - 34B)</li>
   <li>ChatGLM2 (6B)</li>
+  <li>GLM4 (9B)</li>
   <li>Falcon (7B - 180B)</li>
   <li>YI (6B-34B)</li>
   <li>Mistral (7B)</li>
   <li>DeepSeek-MoE (16B)</li>
+  <li>DeepSeek-V2 (16B, 236B)</li>
   <li>Mixtral (8x7B, 8x22B)</li>
   <li>Gemma (2B - 7B)</li>
   <li>Dbrx (132B)</li>
+  <li>StarCoder2 (3B - 15B)</li>
+  <li>Phi-3-mini (3.8B)</li>
 </ul>
 </td>
 <td>
 <ul>
   <li>LLaVA(1.5,1.6) (7B-34B)</li>
-  <li>InternLM-XComposer (7B)</li>
   <li>InternLM-XComposer2 (7B, 4khd-7B)</li>
   <li>QWen-VL (7B)</li>
   <li>DeepSeek-VL (7B)</li>
   <li>InternVL-Chat (v1.1-v1.5)</li>
   <li>MiniGeminiLlama (7B)</li>
-  <li>StarCoder2 (3B - 15B)</li>
+  <li>CogVLM-Chat (17B)</li>
+  <li>CogVLM2-Chat (19B)</li>
+  <li>MiniCPM-Llama3-V-2_5</li>
 </ul>
 </td>
 </tr>
@@ -156,7 +166,7 @@ pip install lmdeploy
 自 v0.3.0 起，LMDeploy 预编译包默认基于 CUDA 12 编译。如果需要在 CUDA 11+ 下安装 LMDeploy，请执行以下命令：
 
 ```shell
-export LMDEPLOY_VERSION=0.3.0
+export LMDEPLOY_VERSION=0.5.0
 export PYTHON_VERSION=38
 pip install https://github.com/InternLM/lmdeploy/releases/download/v${LMDEPLOY_VERSION}/lmdeploy-${LMDEPLOY_VERSION}+cu118-cp${PYTHON_VERSION}-cp${PYTHON_VERSION}-manylinux2014_x86_64.whl --extra-index-url https://download.pytorch.org/whl/cu118
 ```
@@ -165,7 +175,7 @@ pip install https://github.com/InternLM/lmdeploy/releases/download/v${LMDEPLOY_V
 
 ```python
 import lmdeploy
-pipe = lmdeploy.pipeline("internlm/internlm-chat-7b")
+pipe = lmdeploy.pipeline("internlm/internlm2-chat-7b")
 response = pipe(["Hi, pls intro yourself", "Shanghai is"])
 print(response)
 ```
@@ -201,6 +211,7 @@ print(response)
 # 社区项目
 
 - 使用LMDeploy在英伟达Jetson系列板卡部署大模型：[LMDeploy-Jetson](https://github.com/BestAnHongjun/LMDeploy-Jetson)
+- 使用 LMDeploy 和 BentoML 部署大模型的示例项目：[BentoLMDeploy](https://github.com/bentoml/BentoLMDeploy)
 
 # 贡献指南
 

@@ -26,6 +26,9 @@ ______________________________________________________________________
 <details open>
 <summary><b>2024</b></summary>
 
+- \[2024/06\] PyTorch engine support DeepSeek-V2 and several VLMs, such as CogVLM2, Mini-InternVL, LlaVA-Next
+- \[2024/05\] Balance vision model when deploying VLMs with multiple GPUs
+- \[2024/05\] Support 4-bits weight-only quantization and inference on VMLs, such as InternVL v1.5, LLaVa, InternLMXComposer2
 - \[2024/04\] Support Llama3 and more VLMs, such as InternVL v1.1, v1.2, MiniGemini, InternLMXComposer2.
 - \[2024/04\] TurboMind adds online int8/int4 KV cache quantization and inference for all supported devices. Refer [here](docs/en/quantization/kv_quant.md) for detailed guide
 - \[2024/04\] TurboMind latest upgrade boosts GQA, rocketing the [internlm2-20b](https://huggingface.co/internlm/internlm2-20b) model inference to 16+ RPS, about 1.8x faster than vLLM.
@@ -106,32 +109,39 @@ For detailed inference benchmarks in more devices and more settings, please refe
   <li>Llama3 (8B, 70B)</li>
   <li>InternLM (7B - 20B)</li>
   <li>InternLM2 (7B - 20B)</li>
+  <li>InternLM2.5 (7B)</li>
   <li>QWen (1.8B - 72B)</li>
   <li>QWen1.5 (0.5B - 110B)</li>
   <li>QWen1.5 - MoE (0.5B - 72B)</li>
+  <li>QWen2 (0.5B - 72B)</li>
   <li>Baichuan (7B)</li>
   <li>Baichuan2 (7B-13B)</li>
   <li>Code Llama (7B - 34B)</li>
   <li>ChatGLM2 (6B)</li>
+  <li>GLM4 (9B)</li>
   <li>Falcon (7B - 180B)</li>
   <li>YI (6B-34B)</li>
   <li>Mistral (7B)</li>
   <li>DeepSeek-MoE (16B)</li>
+  <li>DeepSeek-V2 (16B, 236B)</li>
   <li>Mixtral (8x7B, 8x22B)</li>
   <li>Gemma (2B - 7B)</li>
   <li>Dbrx (132B)</li>
+  <li>StarCoder2 (3B - 15B)</li>
+  <li>Phi-3-mini (3.8B)</li>
 </ul>
 </td>
 <td>
 <ul>
   <li>LLaVA(1.5,1.6) (7B-34B)</li>
-  <li>InternLM-XComposer (7B)</li>
   <li>InternLM-XComposer2 (7B, 4khd-7B)</li>
   <li>QWen-VL (7B)</li>
   <li>DeepSeek-VL (7B)</li>
   <li>InternVL-Chat (v1.1-v1.5)</li>
   <li>MiniGeminiLlama (7B)</li>
-  <li>StarCoder2 (3B - 15B)</li>
+  <li>CogVLM-Chat (17B)</li>
+  <li>CogVLM2-Chat (19B)</li>
+  <li>MiniCPM-Llama3-V-2_5</li>
 </ul>
 </td>
 </tr>
@@ -155,7 +165,7 @@ pip install lmdeploy
 Since v0.3.0, The default prebuilt package is compiled on **CUDA 12**. However, if CUDA 11+ is required, you can install lmdeploy by:
 
 ```shell
-export LMDEPLOY_VERSION=0.3.0
+export LMDEPLOY_VERSION=0.5.0
 export PYTHON_VERSION=38
 pip install https://github.com/InternLM/lmdeploy/releases/download/v${LMDEPLOY_VERSION}/lmdeploy-${LMDEPLOY_VERSION}+cu118-cp${PYTHON_VERSION}-cp${PYTHON_VERSION}-manylinux2014_x86_64.whl --extra-index-url https://download.pytorch.org/whl/cu118
 ```
@@ -164,7 +174,7 @@ pip install https://github.com/InternLM/lmdeploy/releases/download/v${LMDEPLOY_V
 
 ```python
 import lmdeploy
-pipe = lmdeploy.pipeline("internlm/internlm-chat-7b")
+pipe = lmdeploy.pipeline("internlm/internlm2-chat-7b")
 response = pipe(["Hi, pls intro yourself", "Shanghai is"])
 print(response)
 ```
@@ -200,6 +210,8 @@ For detailed user guides and advanced guides, please refer to our [tutorials](ht
 # Third-party projects
 
 - Deploying LLMs offline on the NVIDIA Jetson platform by LMDeploy: [LMDeploy-Jetson](https://github.com/BestAnHongjun/LMDeploy-Jetson)
+
+- Example project for deploying LLMs using LMDeploy and BentoML: [BentoLMDeploy](https://github.com/bentoml/BentoLMDeploy)
 
 # Contributing
 

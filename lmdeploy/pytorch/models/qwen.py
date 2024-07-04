@@ -4,37 +4,36 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 from torch import nn
-from torch.distributed._tensor import DeviceMesh, Shard, distribute_tensor
 from transformers.modeling_outputs import BaseModelOutputWithPast
 
-from ..dist_utils import (colwise_parallelize_linear_fn,
-                          rowwise_parallelize_linear_fn, try_to_local)
 from ..kernels import apply_rotary_pos_emb, fill_kv_cache, paged_attention_fwd
+from ..weight_loader.dist_utils import (colwise_parallelize_linear,
+                                        colwise_split_parallelize_linear,
+                                        rowwise_parallelize_linear)
 
 
 class PatchedQWenAttention(nn.Module):
 
-    def _distribute_partition_fn(self, mod_name: str, mod: nn.Module,
-                                 device_mesh: DeviceMesh):
-        """Distribution partition callback."""
-        if mod_name in ['c_attn']:
-            for name, param in mod.named_parameters():
-                splited_param = param.split(self.hidden_size, dim=0)
-                updated_param = []
-                for p in splited_param:
-                    dist_tensor = distribute_tensor(p, device_mesh, [Shard(0)])
-                    dist_tensor = try_to_local(dist_tensor)
-                    updated_param.append(dist_tensor)
-                param = torch.cat(updated_param)
-                dist_param = torch.nn.Parameter(param)
-                mod.register_parameter(name, dist_param)
-        elif mod_name in ['c_proj']:
-            rowwise_parallelize_linear_fn(mod,
-                                          device_mesh=device_mesh,
-                                          to_local=True)
+    def _load_weights(self, loader, rank: int, world_size: int,
+                      device: torch.device):
+        for mod_name in ['c_attn']:
+            w_pack_out = self.c_attn.out_features
+            sections = [w_pack_out // 3] * 3
+            colwise_split_parallelize_linear(getattr(self, mod_name),
+                                             sections,
+                                             loader,
+                                             rank=rank,
+                                             world_size=world_size,
+                                             prefix=mod_name)
+        for mod_name in ['c_proj']:
+            rowwise_parallelize_linear(getattr(self, mod_name),
+                                       loader,
+                                       rank=rank,
+                                       world_size=world_size,
+                                       prefix=mod_name)
 
     @classmethod
-    def _distribute_output_fn(cls, outputs, device_mesh: DeviceMesh):
+    def _distribute_output_fn(cls, outputs, **kwargs):
         """Distribution output hook."""
         dist.all_reduce(outputs[0])
         return outputs
@@ -155,21 +154,24 @@ class PatchedQWenAttention(nn.Module):
 
 class PatchedQWenMLP(nn.Module):
 
-    @classmethod
-    def _distribute_partition_fn(cls, mod_name: str, mod: nn.Module,
-                                 device_mesh: DeviceMesh):
-        """Distribution partition callback."""
-        if mod_name in ['w1', 'w2']:
-            colwise_parallelize_linear_fn(mod,
-                                          device_mesh=device_mesh,
-                                          to_local=True)
-        elif mod_name in ['c_proj']:
-            rowwise_parallelize_linear_fn(mod,
-                                          device_mesh=device_mesh,
-                                          to_local=True)
+    def _load_weights(self, loader, rank: int, world_size: int,
+                      device: torch.device):
+        """load weights."""
+        for mod_name in ['w1', 'w2']:
+            colwise_parallelize_linear(getattr(self, mod_name),
+                                       loader,
+                                       rank=rank,
+                                       world_size=world_size,
+                                       prefix=mod_name)
+        for mod_name in ['c_proj']:
+            rowwise_parallelize_linear(getattr(self, mod_name),
+                                       loader,
+                                       rank=rank,
+                                       world_size=world_size,
+                                       prefix=mod_name)
 
     @classmethod
-    def _distribute_output_fn(cls, outputs, device_mesh: DeviceMesh):
+    def _distribute_output_fn(cls, outputs, **kwargs):
         """Distribution output hook."""
         dist.all_reduce(outputs)
         return outputs

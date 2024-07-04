@@ -42,8 +42,24 @@ _SUPPORTED_ARCHS = dict(
     Qwen2MoeForCausalLM=True,
     # Dbrx 132B
     DbrxForCausalLM=True,
+    # cogvlm-chat
+    CogVLMForCausalLM=True,
+    # llava
+    LlavaLlamaForCausalLM=True,
+    # llava mistral
+    LlavaMistralForCausalLM=True,
+    # deepseekvl
+    MultiModalityCausalLM=False,
     # StarCoder2
     Starcoder2ForCausalLM=True,
+    # llava hf
+    LlavaForConditionalGeneration=True,
+    # llava_next hf
+    LlavaNextForConditionalGeneration=True,
+    # deepseek-v2
+    DeepseekV2ForCausalLM=True,
+    # internvl
+    InternVLChatModel=True,
 )
 
 

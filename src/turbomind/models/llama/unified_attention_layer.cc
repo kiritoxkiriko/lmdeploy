@@ -28,6 +28,7 @@
 #include "src/turbomind/models/llama/llama_kernels.h"
 #include "src/turbomind/models/llama/llama_utils.h"
 #include "src/turbomind/utils/Tensor.h"
+#include "src/turbomind/utils/anomaly_handler.h"
 #include "src/turbomind/utils/cuda_utils.h"
 #include "src/turbomind/utils/debug_utils.h"
 #include "src/turbomind/utils/logger.h"
@@ -58,13 +59,40 @@ void UnifiedAttentionLayer<T>::allocateBuffer(size_t            q_count,
 
     qkv_buf_3_ = (T*)allocator_->reMalloc(qkv_buf_3_, sizeof(T) * q_count * local_head_num_ * size_per_head_, false);
 
-    tmp_kv_buf_ =
-        (T*)allocator_->reMalloc(tmp_kv_buf_, sizeof(T) * local_kv_head_num_ * 2 * k_count * size_per_head_, false);
-
-    dc_workspace_ = (float*)allocator_->reMalloc(
-        dc_workspace_, sizeof(float) * batch_size * local_head_num_ * kDecodeMaxSplits * (size_per_head_ + 2), false);
+    // Pad the tmp buffer for linear KV cache by `MAX_CTA_S` to avoid illegal accesses
+    tmp_kv_buf_ = (T*)allocator_->reMalloc(
+        tmp_kv_buf_, sizeof(T) * local_kv_head_num_ * 2 * (k_count + MAX_CTA_S) * size_per_head_, false);
 
     is_allocate_buffer_ = true;
+}
+
+template<typename T>
+void UnifiedAttentionLayer<T>::allocateWorkspace()
+{
+    TM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    FT_CHECK(!is_allocate_workspace_);
+    partial_M_ = (float*)allocator_->malloc(sizeof(float) * kMaxWorkspaceTokens * local_head_num_);
+    partial_L_ = (float*)allocator_->malloc(sizeof(float) * kMaxWorkspaceTokens * local_head_num_);
+    partial_O_ = (float*)allocator_->malloc(sizeof(float) * kMaxWorkspaceTokens * local_head_num_ * size_per_head_);
+    split_cnt_ = (int*)allocator_->malloc(sizeof(int) * kMaxWorkspaceTokens);
+    barriers_  = (int*)allocator_->malloc(sizeof(int) * kMaxWorkspaceTokens * local_head_num_, true, false);
+    is_allocate_workspace_ = true;
+}
+
+template<typename T>
+void UnifiedAttentionLayer<T>::freeWorkspace()
+{
+    if (is_allocate_workspace_) {
+        TM_LOG_DEBUG(__PRETTY_FUNCTION__);
+
+        allocator_->free((void**)&partial_M_);
+        allocator_->free((void**)&partial_L_);
+        allocator_->free((void**)&partial_O_);
+        allocator_->free((void**)&split_cnt_);
+        allocator_->free((void**)&barriers_);
+
+        is_allocate_workspace_ = false;
+    }
 }
 
 template<typename T>
@@ -76,8 +104,6 @@ void UnifiedAttentionLayer<T>::freeBuffer()
         allocator_->free((void**)&qkv_buf_);
         allocator_->free((void**)&qkv_buf_3_);
         allocator_->free((void**)&tmp_kv_buf_);
-
-        allocator_->free((void**)&dc_workspace_);
 
         is_allocate_buffer_ = false;
     }
@@ -144,7 +170,7 @@ inline void UnifiedAttentionLayer<T>::forward(TensorMap* outputs, const TensorMa
     // [L, 2, H, s, D]
     const size_t layer_offset = layer_id * 2 * local_kv_head_num_ * kv_cache_block_len_ * size_per_head_;
 
-    static int count = 0;
+    // static int count = 0;
 
     // if (layer_id == 0 && count == 0) {
     //     Compare(attention_input, num_token * weights->qkv.input_dims, "qkv_input", kCmpRead, stream_);
@@ -156,16 +182,20 @@ inline void UnifiedAttentionLayer<T>::forward(TensorMap* outputs, const TensorMa
     // [token_num, hidden_dim] -> [token_num, 3, local_hidden_dim]
     linear_.forward(qkv_buf_, attention_input, token_num, weights->qkv, LlamaLinear<T>::kGemm, lora_mask);
 
+    count_and_fix(qkv_buf_, token_num * weights->qkv.output_dims, Concat("qkv", layer_id), 3);
+
     // if (layer_id == 0 && count == 0) {
     //     Compare(qkv_buf_, num_token * weights->qkv.output_dims, "qkv_buf", kCmpRead, stream_);
     // }
 
     auto stream_ptr = streams_.data();
 
-    auto CreateParams = [&](int offset, int batch_size, cudaStream_t stream) {
+    auto CreateParams = [&](int offset, int batch_size, int max_kv_splits, cudaStream_t stream) {
         AttentionParams<T> params{};
-#if 1
-        params.out    = qkv_buf_3_;
+
+        // Batch offset for `out` and `q` are computed inside the kernel
+        params.out = qkv_buf_3_;
+
         params.q      = (T*)qkv_buf_;
         params.k      = params.q + local_head_num_ * size_per_head_;
         params.v      = params.k + local_kv_head_num_ * size_per_head_;
@@ -182,11 +212,13 @@ inline void UnifiedAttentionLayer<T>::forward(TensorMap* outputs, const TensorMa
         params.max_q_len  = *std::max_element(h_q_len + offset, h_q_len + offset + batch_size);
         params.max_k_len  = *std::max_element(h_k_len + offset, h_k_len + offset + batch_size);
 
+        // Decoding use only
         params.block_iter_params = BlockIteratorParams{(char**)block_ptrs,  //
                                                        (int*)cu_block_count + offset,
                                                        layer_id,
                                                        (int)kv_cache_block_len_};
 
+        // Prefilling use only
         const int sum_k_len       = h_cu_k_len[offset + pf_batch_size] - h_cu_k_len[offset];
         params.linear_iter_params = LinearIteratorParams{tmp_kv_buf_,  //
                                                          int(2 * sum_k_len * size_per_head_),
@@ -203,7 +235,7 @@ inline void UnifiedAttentionLayer<T>::forward(TensorMap* outputs, const TensorMa
         // MSVC does not have M_LOG2E
         params.inv_sqrt_dh = (float)std::log2(expf(1.)) / std::sqrt((float)params.size_per_head);
 
-        params.rotary_embedding_dim    = size_per_head_;
+        params.rotary_embedding_dim    = params_.rotary_embedding_dim;
         params.rotary_embedding_base   = params_.rotary_embedding_base;
         params.max_position_embeddings = params_.max_position_embeddings;
         params.rope_ti_scale           = 1.f;
@@ -213,15 +245,20 @@ inline void UnifiedAttentionLayer<T>::forward(TensorMap* outputs, const TensorMa
 
         params.use_logn_attn = params_.use_logn_attn;
 
-        params.max_split_k = 1;
+        // Decoding use only for now
+        FT_CHECK(barriers_);
+        params.split_cnt   = split_cnt_;
+        params.partial_L   = partial_L_;
+        params.partial_M   = partial_M_;
+        params.partial_O   = partial_O_;
+        params.locks       = barriers_;
+        params.max_split_k = std::min(std::max(1, kMaxWorkspaceTokens / params.token_num), max_kv_splits);
 
         params.arch   = arch_;
         params.stream = stream;
 
         params.quant_policy = quant_policy_;
-        // FT_CHECK(std::size(weights->past_kv_scale) == std::size(params.kv_quant_params));
-        // std::copy(weights->past_kv_scale.begin(), weights->past_kv_scale.end(), std::begin(params.kv_quant_params));
-#endif
+
         return params;
     };
 
@@ -237,7 +274,9 @@ inline void UnifiedAttentionLayer<T>::forward(TensorMap* outputs, const TensorMa
     if (pf_batch_size) {
         const int offset    = dc_batch_size;
         const int sum_k_len = h_cu_k_len[offset + pf_batch_size] - h_cu_k_len[offset];
-        auto      params    = CreateParams(offset, pf_batch_size, pf_stream);
+        // We are executing prefill & decoding kernels concurrently, but only have 1 workspace
+        // disable split kv for prefill for now
+        auto params = CreateParams(offset, pf_batch_size, 1, pf_stream);
         if constexpr (sizeof(T) == 2) {
             invokeProcessKV_v2_(params);
             /// TODO: skip flattening for `sm_80`
@@ -247,7 +286,7 @@ inline void UnifiedAttentionLayer<T>::forward(TensorMap* outputs, const TensorMa
     }
 
     if (dc_batch_size) {
-        auto params = CreateParams(0, dc_batch_size, dc_stream);
+        auto params = CreateParams(0, dc_batch_size, kMaxKVSplits, dc_stream);
         if constexpr (sizeof(T) == 2) {
             dispatchDecoding<T>(params);
         }
@@ -264,11 +303,15 @@ inline void UnifiedAttentionLayer<T>::forward(TensorMap* outputs, const TensorMa
     //     dump(qkv_buf_3_, num_token * weights->output.input_dims, stream_, "qkv_buf_3");
     // }
 
+    count_and_fix(qkv_buf_3_, token_num * weights->output.input_dims, Concat("attn", layer_id), 3);
+
     //////////////////////////////////////////////
     /// output gemm <Bs,HD> -> <Bs,HD>
     linear_.forward(attention_out, qkv_buf_3_, token_num, weights->output, LlamaLinear<T>::kGemm, lora_mask);
 
-    ++count;
+    // ++count;
+
+    count_and_fix(attention_out, token_num * weights->output.output_dims, Concat("wo", layer_id), 3);
 
     if (tensor_para_.world_size_ > 1) {
         NcclGuard nccl_guard(tensor_para_, stream_);

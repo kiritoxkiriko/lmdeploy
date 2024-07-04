@@ -9,6 +9,7 @@ add_library(Llama STATIC
         LlamaV2.cc
         LlamaBatch.cc
         BlockManager.cc
+        BlockTrie.cc
         SequenceManager.cc
         LlamaWeight.cc
         LlamaDecoderLayerWeight.cc
@@ -35,7 +36,8 @@ target_link_libraries(Llama PUBLIC CUDA::cudart
         memory_utils
         nccl_utils
         cuda_utils
-        logger)
+        logger
+        anomaly_handler)
 
 
 add_executable(llama_gemm llama_gemm.cc)

@@ -1,7 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import enum
 import time
-from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
@@ -14,6 +13,24 @@ from lmdeploy.utils import get_logger
 from .block import LogicalTokenBlocks
 
 logger = get_logger('lmdeploy')
+
+# vlm input type from pipeline
+InputEmbeddingType = List[np.ndarray]
+InputEmbeddingRangeType = List[List[int]]
+
+
+@dataclass
+class InputEmbeddings:
+    """InputEmbeddings."""
+    embeddings: np.ndarray
+    start: int
+    end: int
+
+    def move_position(self, offset: int = 0):
+        if offset != 0:
+            self.start += offset
+            self.end += offset
+        return self
 
 
 @dataclass
@@ -55,7 +72,10 @@ class SamplingParam:
             logger.warning('`top_p` has to be a float > 0 and < 1'
                            f' but is {top_p}')
             top_p = 1.0
-        if temperature <= 0:
+        if temperature == 0:
+            logger.warning('`temperature` is 0, set to 1e-6')
+            temperature = 1e-6
+        if temperature < 0:
             logger.warning('`temperature` has to be a strictly'
                            f' positive value, but is {temperature}')
             temperature = 1.0
@@ -171,11 +191,14 @@ class SchedulerSession:
         self.sequences: SeqMap = dict()
         self.seq_manager = seq_manager
 
-    def add_sequence(self,
-                     token_ids: Tensor,
-                     sampling_param: SamplingParam = None,
-                     adapter_name: str = None,
-                     return_logits: bool = False) -> 'SchedulerSequence':
+    def add_sequence(
+        self,
+        token_ids: Tensor,
+        sampling_param: SamplingParam = None,
+        adapter_name: str = None,
+        return_logits: bool = False,
+        input_embeddings: List[InputEmbeddings] = None,
+    ) -> 'SchedulerSequence':
         """Add a new message."""
         if isinstance(token_ids, Tensor):
             token_ids = token_ids.numpy()
@@ -186,45 +209,20 @@ class SchedulerSession:
         if sampling_param is None:
             sampling_param = SamplingParam()
 
-        seq = SchedulerSequence(seq_id=_new_msg_id(),
-                                session=self,
-                                history_cache=HistoryTokenIds(token_ids),
-                                num_new_tokens=0,
-                                sampling_param=sampling_param,
-                                adapter_name=adapter_name,
-                                arrive_time=time.time(),
-                                return_logits=return_logits)
+        seq = SchedulerSequence(
+            seq_id=_new_msg_id(),
+            session=self,
+            history_cache=HistoryTokenIds(token_ids),
+            num_new_tokens=0,
+            sampling_param=sampling_param,
+            adapter_name=adapter_name,
+            arrive_time=time.time(),
+            history_embeddings=HistoryEmbeddings(input_embeddings),
+            return_logits=return_logits)
         self.sequences[seq.seq_id] = seq
         if self.seq_manager is not None:
             self.seq_manager.add_sequence(seq)
         return seq
-
-    def fork_sequence(
-            self,
-            seq: 'SchedulerSequence',
-            sampling_param: SamplingParam = None) -> 'SchedulerSequence':
-        """Fork a new message from exist message."""
-        if sampling_param is None:
-            sampling_param = deepcopy(seq.sampling_param)
-        assert seq.session == self
-
-        new_msg = SchedulerSequence(seq_id=_new_msg_id(),
-                                    session=self,
-                                    history_cache=seq.history_cache.clone(),
-                                    num_new_tokens=0,
-                                    sampling_param=sampling_param,
-                                    logical_blocks=seq.logical_blocks.clone(),
-                                    adapter_name=seq.adapter_name,
-                                    arrive_time=time.time(),
-                                    meta=deepcopy(seq.meta),
-                                    return_logits=seq.return_logits,
-                                    random_offsets=seq.random_offsets + 1)
-        new_msg._num_history_ids = seq._num_history_ids
-        new_msg._num_token_ids = seq._num_token_ids
-        new_msg.status = seq.status
-
-        self.sequences[new_msg.seq_id] = new_msg
-        return new_msg
 
     def remove_sequence(self, seq: 'SchedulerSequence'):
         """remove sequence."""
@@ -242,6 +240,54 @@ def _div_up(x, n):
 def _round_up(x, n):
     """perform round up."""
     return _div_up(x, n) * n
+
+
+class HistoryEmbeddings:
+    """History embeddings."""
+
+    def __init__(self, embeddings: List[InputEmbeddings] = None):
+        self._embeddings: List[InputEmbeddings] = []
+        if embeddings is not None:
+            self._embeddings.extend(embeddings)
+
+    def append(self, embeddings: List[InputEmbeddings]):
+        self._embeddings.extend(embeddings)
+
+    def clone(self):
+        ret = HistoryEmbeddings(self._embeddings)
+        return ret
+
+    def copy(self):
+        return self.clone()
+
+    def get_step(self, step: int) -> int:
+        """get step before a whole image."""
+        real_step = step
+        num_all_images = len(self._embeddings)
+        history_image_num = 0
+        if num_all_images > 0:
+            history_image_num = sum(
+                [1 for emb in self._embeddings if emb.end <= step])
+            if history_image_num < num_all_images:
+                emb = self._embeddings[history_image_num]
+                # for case step in middle of an image
+                if emb.start < step:
+                    real_step = emb.start
+        num_images = num_all_images - history_image_num
+        return real_step, history_image_num, num_images
+
+    @property
+    def embeddings(self):
+        """embeddings."""
+        return self._embeddings
+
+    def __len__(self):
+        """get num images."""
+        return len(self._embeddings)
+
+    def __getitem__(self, *args, **kwargs):
+        """get values."""
+        return self._embeddings.__getitem__(*args, **kwargs)
 
 
 class HistoryTokenIds:
@@ -307,6 +353,8 @@ class SchedulerSequence:
     seq_id: int
     session: SchedulerSession
     history_cache: HistoryTokenIds = field(default_factory=HistoryTokenIds)
+    history_embeddings: HistoryEmbeddings = field(
+        default_factory=HistoryEmbeddings)
     num_new_tokens: int = 0
     sampling_param: SamplingParam = field(default_factory=SamplingParam)
     logical_blocks: LogicalTokenBlocks = field(
@@ -324,6 +372,8 @@ class SchedulerSequence:
     def __post_init__(self):
         """post init."""
         self._num_history_ids: int = 0
+        self._num_history_images: int = 0
+        self._num_images: int = len(self.history_embeddings)
         self._num_token_ids: int = len(self.history_cache)
 
     @property
@@ -337,6 +387,19 @@ class SchedulerSequence:
         return self._num_history_ids
 
     @property
+    def history_image_num(self) -> int:
+        """get history image number."""
+        return self._num_history_images
+
+    @property
+    def history_image_token_len(self) -> int:
+        """get history image token length."""
+        return sum([
+            emb.end - emb.start
+            for emb in self.history_embeddings[:self._num_history_images]
+        ])
+
+    @property
     def session_id(self) -> int:
         """get session id."""
         return self.session.session_id
@@ -347,6 +410,13 @@ class SchedulerSequence:
         start = self.history_len
         end = start + self._num_token_ids
         return self.history_cache[start:end]
+
+    @property
+    def input_embeddings(self) -> List[InputEmbeddings]:
+        """get current embeddings."""
+        start = self.history_image_num
+        end = start + self._num_images
+        return self.history_embeddings[start:end]
 
     @property
     def history_ids(self) -> np.ndarray:
@@ -366,6 +436,10 @@ class SchedulerSequence:
     @property
     def num_token_ids(self):
         return self._num_token_ids
+
+    @property
+    def num_images(self):
+        return self._num_images
 
     @property
     def num_all_ids(self):
@@ -395,9 +469,21 @@ class SchedulerSequence:
         """num all tokens."""
         return self.num_all_ids
 
-    def update_token_ids(self, token_ids: Tensor):
+    def update_token_ids(self,
+                         token_ids: Tensor,
+                         embeddings: List[InputEmbeddings] = None):
         """Update token ids, old token ids will be added to history."""
         self._num_history_ids += self._num_token_ids
+        # update history image nums
+        self._num_history_images += self._num_images
+        self._num_images = 0
+        if embeddings is not None:
+            new_embeddings = [
+                emb.move_position(self._num_history_ids) for emb in embeddings
+            ]
+            self._num_images = len(new_embeddings)
+            self.history_embeddings.append(new_embeddings)
+
         if isinstance(token_ids, Tensor):
             token_ids = token_ids.numpy()
         elif not isinstance(token_ids, np.ndarray):
@@ -412,6 +498,12 @@ class SchedulerSequence:
     def set_step(self, step: int):
         """set step."""
         num_all_ids = self.num_all_ids
+        # update step for vlm
+        if len(self.history_embeddings) > 0:
+            new_step, self._num_history_images, self._num_images = \
+                self.history_embeddings.get_step(step)
+            assert 0 <= new_step <= step
+            step = new_step
         self._num_history_ids = step
         self._num_token_ids = num_all_ids - step
         self.num_ignored_history = min(step, self.num_ignored_history)

@@ -87,8 +87,14 @@ def get_model_name(model):
         return 'vicuna'
     if ('yi-vl' in model_name):
         return 'yi-vl'
-    if ('qwen1.5' in model_name):
+    if ('qwen' in model_name):
         return 'qwen'
+    if ('internvl') in model_name:
+        return 'internvl-internlm2'
+    if ('internlm-xcomposer2-4khd-7b') in model_name:
+        return 'internlm-xcomposer2-4khd'
+    if ('internlm-xcomposer2') in model_name:
+        return 'internlm-xcomposer2'
     if len(model_name.split('-')) > 2 and '-'.join(
             model_name.split('-')[0:2]) in model_names:
         return '-'.join(model_name.split('-')[0:2])

@@ -52,7 +52,7 @@ on:
         required: true
         description: 'Set models run benchmark'
         type: string
-        default: "['internlm/internlm2-chat-20b','internlm/internlm2-chat-20b-inner-4bits','meta-llama/Llama-2-7b-chat-hf','meta-llama/Llama-2-7b-chat-hf-inner-4bits']"
+        default: "['internlm/internlm2-chat-20b','internlm/internlm2-chat-20b-inner-4bits','meta-llama/Llama-2-7b-chat-hf','meta-llama/Llama-2-7b-chat-hf-inner-4bits','meta-llama/Meta-Llama-3-8B-Instruct','Qwen/Qwen1.5-32B-Chat']"
 
 env:
   HOST_PIP_CACHE_DIR: /nvme/github-actions/pip-cache
@@ -61,7 +61,7 @@ env:
   REPORT_DIR: /nvme/qa_test_models/benchmark-reports/${{ github.run_id }}
   DATASET_FILE: /nvme/qa_test_models/datasets/ShareGPT_V3_unfiltered_cleaned_split.json
   TP_INFO: --tp 1
-  LOOP_NUM: 3
+  LOOP_NUM: 1
   TRITON_PTXAS_PATH: /usr/local/cuda/bin/ptxas
 
 
@@ -115,7 +115,7 @@ jobs:
       CUDA_VISIBLE_DEVICES: 6,7
     container:
       image: nvcr.io/nvidia/tritonserver:22.12-py3
-      options: "--gpus=all --ipc=host --user root -e PIP_CACHE_DIR=/root/.cache/pip"
+      options: "--gpus=all --ipc=host --user root -e PIP_CACHE_DIR=/root/.cache/pip --pull never"
       volumes:
         - /nvme/github-actions/pip-cache:/root/.cache/pip
         - /nvme/github-actions/packages:/root/packages
@@ -172,6 +172,14 @@ jobs:
           rm -rf ${result_dir}
           mkdir ${result_dir}
           python3 benchmark/profile_generation.py $MODEL_PATH $MAX_ENTRY_COUNT $MODEL_FORMAT $TP_INFO -c 128 -ct 128 2048 128 -pt 128 128 2048 --csv ${result_dir}/generation.csv > ${result_dir}/generation.log
+      - name: Run generation benchmark - longtext turbomind
+        if: contains(fromJSON(github.event.inputs.backend), 'turbomind') && contains(env.LONGTEXT_BENCHMARK, 'true')
+        env:
+          result_dir: benchmark-generation-longtext-turbomind
+        run: |
+          rm -rf ${result_dir}
+          mkdir ${result_dir}
+          python3 benchmark/profile_generation.py $MODEL_PATH $MODEL_FORMAT $TP_INFO --rope-scaling-factor 1.0 -c 1 --session-len 200000 -ct 1024 -pt 198000 --csv ${result_dir}/generation_longtext.csv > ${result_dir}/generation_longtext.log
       - name: Run generation benchmark - pytorch
         if: (!contains(env.MODEL_FORMAT, 'awq') && contains(fromJSON(github.event.inputs.backend), 'pytorch'))
         env:
@@ -180,6 +188,14 @@ jobs:
           rm -rf ${result_dir}
           mkdir ${result_dir}
           python3 benchmark/profile_generation.py $MODEL_PATH $TP_INFO --backend pytorch -c 128 -ct 128 2048 128 -pt 128 128 2048 --csv ${result_dir}/generation.csv > ${result_dir}/generation.log
+      - name: Run generation benchmark - longtext pytorch
+        if: (!contains(env.MODEL_FORMAT, 'awq') && contains(fromJSON(github.event.inputs.backend), 'pytorch') && contains(env.LONGTEXT_BENCHMARK, 'true'))
+        env:
+          result_dir: benchmark-generation-longtext-pytorch
+        run: |
+          rm -rf ${result_dir}
+          mkdir ${result_dir}
+          python3 benchmark/profile_generation.py $MODEL_PATH $MODEL_FORMAT $TP_INFO --backend pytorch -c 1 --session-len 200000 -ct 1024 -pt 198000 --csv ${result_dir}/generation_longtext.csv > ${result_dir}/generation_longtext.log
       - name: Save reports
         if: always()
         run: |
@@ -211,7 +227,7 @@ jobs:
       CUDA_VISIBLE_DEVICES: 4,5
     container:
       image: nvcr.io/nvidia/tritonserver:22.12-py3
-      options: "--gpus=all --ipc=host --user root -e PIP_CACHE_DIR=/root/.cache/pip"
+      options: "--gpus=all --ipc=host --user root -e PIP_CACHE_DIR=/root/.cache/pip --pull never"
       volumes:
         - /nvme/github-actions/pip-cache:/root/.cache/pip
         - /nvme/github-actions/packages:/root/packages
@@ -268,27 +284,12 @@ jobs:
         run: |
           rm -rf ${result_dir}
           mkdir ${result_dir}
-          batches=(128 256)
-          for batch in "${batches[@]}"
+          batches=($BATCHES)
+          for batch in ${batches[@]}
           do
             for ((i=1; i<=$LOOP_NUM; i++))
               do
                 python3 benchmark/profile_throughput.py $DATASET_FILE $MODEL_PATH $MAX_ENTRY_COUNT $MODEL_FORMAT $TP_INFO --concurrency "$batch" --num-prompts 3000 --csv ${result_dir}/throughput_csv_batch_"${batch}"_"${i}"th.csv &> ${result_dir}/throughput_batch_"${batch}"_"${i}"th.log
-              done
-          done
-      - name: Run throughput benchmark - kvint4
-        if: contains(fromJSON(github.event.inputs.backend), 'turbomind') && contains(fromJSON(github.event.inputs.kvint_quantization), 'kvint4')
-        env:
-          result_dir: benchmark-throughput-turbomind-kvint4
-        run: |
-          rm -rf ${result_dir}
-          mkdir ${result_dir}
-          batches=(128 256)
-          for batch in "${batches[@]}"
-          do
-            for ((i=1; i<=$LOOP_NUM; i++))
-              do
-                python3 benchmark/profile_throughput.py $DATASET_FILE $MODEL_PATH $MAX_ENTRY_COUNT $MODEL_FORMAT $TP_INFO --concurrency "$batch" --num-prompts 3000 --quant-policy 4 --csv ${result_dir}/throughput_csv_batch_"${batch}"_"${i}"th.csv &> ${result_dir}/throughput_batch_"${batch}"_"${i}"th.log
               done
           done
       - name: Run throughput benchmark - kvint8
@@ -298,12 +299,27 @@ jobs:
         run: |
           rm -rf ${result_dir}
           mkdir ${result_dir}
-          batches=(128 256)
-          for batch in "${batches[@]}"
+          batches=($BATCHES)
+          for batch in ${batches[@]}
           do
             for ((i=1; i<=$LOOP_NUM; i++))
               do
                 python3 benchmark/profile_throughput.py $DATASET_FILE $MODEL_PATH $MAX_ENTRY_COUNT $MODEL_FORMAT $TP_INFO --concurrency "$batch" --num-prompts 3000 --quant-policy 8 --csv ${result_dir}/throughput_csv_batch_"${batch}"_"${i}"th.csv &> ${result_dir}/throughput_batch_"${batch}"_"${i}"th.log
+              done
+          done
+      - name: Run throughput benchmark - kvint4
+        if: contains(fromJSON(github.event.inputs.backend), 'turbomind') && contains(fromJSON(github.event.inputs.kvint_quantization), 'kvint4')
+        env:
+          result_dir: benchmark-throughput-turbomind-kvint4
+        run: |
+          rm -rf ${result_dir}
+          mkdir ${result_dir}
+          batches=($BATCHES)
+          for batch in ${batches[@]}
+          do
+            for ((i=1; i<=$LOOP_NUM; i++))
+              do
+                python3 benchmark/profile_throughput.py $DATASET_FILE $MODEL_PATH $MAX_ENTRY_COUNT $MODEL_FORMAT $TP_INFO --concurrency "$batch" --num-prompts 3000 --quant-policy 4 --csv ${result_dir}/throughput_csv_batch_"${batch}"_"${i}"th.csv &> ${result_dir}/throughput_batch_"${batch}"_"${i}"th.log
               done
           done
       - name: Run throughput benchmark - pytorch
@@ -313,8 +329,8 @@ jobs:
         run: |
           rm -rf ${result_dir}
           mkdir ${result_dir}
-          batches=(128 256)
-          for batch in "${batches[@]}"
+          batches=($BATCHES)
+          for batch in ${batches[@]}
           do
             for ((i=1; i<=$LOOP_NUM; i++))
               do
@@ -352,7 +368,7 @@ jobs:
       CUDA_VISIBLE_DEVICES: 6,7
     container:
       image: nvcr.io/nvidia/tritonserver:22.12-py3
-      options: "--gpus=all --ipc=host --user root -e PIP_CACHE_DIR=/root/.cache/pip"
+      options: "--gpus=all --ipc=host --user root -e PIP_CACHE_DIR=/root/.cache/pip --pull never"
       volumes:
         - /nvme/github-actions/pip-cache:/root/.cache/pip
         - /nvme/github-actions/packages:/root/packages
@@ -405,7 +421,7 @@ jobs:
       - name: Start restful api turbomind
         if: contains(fromJSON(github.event.inputs.backend), 'turbomind')
         run: |
-          lmdeploy serve api_server $MODEL_PATH $MAX_ENTRY_COUNT $MODEL_FORMAT $TP_INFO --log-level ${{inputs.log_level}} > turbomind_run.log 2>&1 &
+          lmdeploy serve api_server $MODEL_PATH $MAX_ENTRY_COUNT $MAX_BATCH_SIZE $MODEL_FORMAT $TP_INFO --log-level ${{inputs.log_level}} > turbomind_run.log 2>&1 &
           echo "restful_pid=$!" >> "$GITHUB_ENV"
           sleep 180s
       - name: Run restful benchmark
@@ -415,8 +431,8 @@ jobs:
         run: |
           rm -rf ${result_dir}
           mkdir ${result_dir}
-          batches=(128 256)
-          for batch in "${batches[@]}"
+          batches=($BATCHES)
+          for batch in ${batches[@]}
           do
             for ((i=1; i<=$LOOP_NUM; i++))
               do
@@ -431,7 +447,7 @@ jobs:
       - name: Start restful api turbomind - kvint4
         if: contains(fromJSON(github.event.inputs.backend), 'turbomind') && contains(fromJSON(github.event.inputs.kvint_quantization), 'kvint4')
         run: |
-          lmdeploy serve api_server $MODEL_PATH $MAX_ENTRY_COUNT $MODEL_FORMAT $TP_INFO --quant-policy 4 --log-level ${{inputs.log_level}} > turbomind_kvint4_run.log 2>&1 &
+          lmdeploy serve api_server $MODEL_PATH $MAX_ENTRY_COUNT $MAX_BATCH_SIZE $MODEL_FORMAT $TP_INFO --quant-policy 4 --log-level ${{inputs.log_level}} > turbomind_kvint4_run.log 2>&1 &
           echo "restful_pid=$!" >> "$GITHUB_ENV"
           sleep 180s
       - name: Run restful benchmark -kvint4
@@ -441,7 +457,7 @@ jobs:
         run: |
           rm -rf ${result_dir}
           mkdir ${result_dir}
-          batches=(128 256)
+          batches=($BATCHES)
           for batch in "${batches[@]}"
           do
             for ((i=1; i<=$LOOP_NUM; i++))
@@ -456,7 +472,7 @@ jobs:
       - name: Start restful api turbomind - kvint8
         if: contains(fromJSON(github.event.inputs.backend), 'turbomind') && contains(fromJSON(github.event.inputs.kvint_quantization), 'kvint8')
         run: |
-          lmdeploy serve api_server $MODEL_PATH $MAX_ENTRY_COUNT $MODEL_FORMAT $TP_INFO --quant-policy 8 --log-level ${{inputs.log_level}} > turbomind_kvint8_run.log 2>&1 &
+          lmdeploy serve api_server $MODEL_PATH $MAX_ENTRY_COUNT $MAX_BATCH_SIZE $MODEL_FORMAT $TP_INFO --quant-policy 8 --log-level ${{inputs.log_level}} > turbomind_kvint8_run.log 2>&1 &
           echo "restful_pid=$!" >> "$GITHUB_ENV"
           sleep 180s
       - name: Run restful benchmark -kvint8
@@ -466,7 +482,7 @@ jobs:
         run: |
           rm -rf ${result_dir}
           mkdir ${result_dir}
-          batches=(128 256)
+          batches=($BATCHES)
           for batch in "${batches[@]}"
           do
             for ((i=1; i<=$LOOP_NUM; i++))
@@ -491,7 +507,7 @@ jobs:
         run: |
           rm -rf ${result_dir}
           mkdir ${result_dir}
-          batches=(128 256)
+          batches=($BATCHES)
           for batch in "${batches[@]}"
           do
             for ((i=1; i<=$LOOP_NUM; i++))
@@ -544,7 +560,11 @@ jobs:
           repository: ${{ github.event.inputs.repo_org || 'InternLM/lmdeploy' }}
           ref: ${{github.event.inputs.repo_ref || 'main'}}
       - name: Set params
-        if: (contains( matrix.model, 'internlm2-chat-20b'))
+        run: |
+          chmod +x .github/scripts/set_benchmark_param.sh
+          .github/scripts/set_benchmark_param.sh ${{matrix.model}}
+      - name: Set params - cuda allocate
+        if: contains( env.TP_INFO, '--tp 2')
         run: |
           echo 'DEVICE="device=4,5"' >> "$GITHUB_ENV"
       - name: Create test container
@@ -560,6 +580,7 @@ jobs:
             --name "lmdeploy-ci-triton-$GITHUB_RUN_ID-$date_today" \
             --workdir /__w/lmdeploy/lmdeploy \
             --env NCCL_LAUNCH_MODE=GROUP \
+            --pull never \
             -v $(pwd)/../../:/__w \
             -v ${MODEL_PATH}:${MODEL_PATH} \
             -v ${WORKDIR}:/root/workspace/workdir \
@@ -575,7 +596,6 @@ jobs:
       - name: Build lmdeploy from source
         if: ${{github.event_name == 'schedule' || !inputs.offline_mode}}
         run: |
-          docker exec $CONTAINER_ID sed -i 's/https:\/\/github.com\/NVIDIA\/cutlass.git/https:\/\/521github.com\/extdomains\/github.com\/NVIDIA\/cutlass.git/g' CMakeLists.txt
           docker exec $CONTAINER_ID mkdir build
           docker exec --workdir /__w/lmdeploy/lmdeploy/build \
             --env http_proxy=${{secrets.PROXY}} \
@@ -664,7 +684,7 @@ jobs:
         run: |
           rm -rf ${result_dir}
           mkdir ${result_dir} -p
-          batches=(128 256)
+          batches=($BATCHES)
           for batch in "${batches[@]}"
           do
             for ((i=1; i<=$LOOP_NUM; i++))
@@ -706,5 +726,5 @@ jobs:
           ref: ${{github.event.inputs.repo_ref || 'main'}}
       - name: Get overview
         run: |
-          pip install pandas
+          pip install pandas fire
           python3 .github/scripts/action_tools.py generate_benchmark_report $REPORT_DIR

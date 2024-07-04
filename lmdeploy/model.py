@@ -219,7 +219,7 @@ class BaseChatTemplate(BaseModel):
                        assistant=self.eoa + self.separator,
                        system=self.eosys)
         ret = ''
-        if self.meta_instruction is not None:
+        if self.meta_instruction is not None and sequence_start:
             if len(messages) and messages[0]['role'] != 'system':
                 ret += f'{self.system}{self.meta_instruction}{self.eosys}'
         for message in messages:
@@ -228,6 +228,64 @@ class BaseChatTemplate(BaseModel):
             ret += f'{box_map[role]}{content}{eox_map[role]}'
         ret += f'{self.assistant}'
         return ret
+
+
+@MODELS.register_module(name='cogvlm')
+class CogVLM(BaseChatTemplate):
+    """Chat template of CogVLM model."""
+
+    def __init__(self,
+                 meta_instruction='',
+                 eosys='',
+                 user='Question: ',
+                 separator='\n',
+                 eoh=' ',
+                 assistant='Answer:',
+                 eoa='</s>',
+                 stop_words=['</s>'],
+                 **kwargs):
+        super().__init__(meta_instruction=meta_instruction,
+                         eosys=eosys,
+                         user=user,
+                         eoh=eoh,
+                         separator=separator,
+                         assistant=assistant,
+                         eoa=eoa,
+                         stop_words=stop_words,
+                         **kwargs)
+
+    @classmethod
+    def match(cls, model_path: str) -> Optional[str]:
+        """Return the model_name that was registered to MODELS.
+
+        Args:
+            model_path (str): the model path used for matching.
+        """
+        path = model_path.lower()
+        if 'cogvlm' in path and 'cogvlm2' not in path:
+            return 'cogvlm'
+
+
+@MODELS.register_module(name='cogvlm2')
+class CogVLM2(CogVLM):
+    """Chat template of CogVLM2 model."""
+
+    def __init__(self,
+                 eoa='<|end_of_text|>',
+                 stop_words=['<|end_of_text|>'],
+                 **kwargs):
+        super().__init__(eoa=eoa, stop_words=stop_words, **kwargs)
+
+    @classmethod
+    def match(cls, model_path: str) -> Optional[str]:
+        """Return the model_name that was registered to MODELS.
+
+        Args:
+            model_path (str): the model path used for matching.
+        """
+        path = model_path.lower()
+        if 'cogvlm2' in path:
+            return 'cogvlm2'
 
 
 @MODELS.register_module(name='wizardlm')
@@ -262,12 +320,41 @@ class Vicuna(BaseChatTemplate):
             model_path (str): the model path used for matching.
         """
         path = model_path.lower()
-        if 'llava' in path and 'v1.5' in path:
-            return 'vicuna'
-        if 'vicuna' in path:
+        if 'vicuna' in path and 'llava' not in path:
             return 'vicuna'
         if 'wizardlm' in path:
             return 'wizardlm'
+
+
+@MODELS.register_module(name='llava-v1')
+class Llavav1(Vicuna):
+    """Chat template of llava-v1 model."""
+
+    def __init__(
+            self,
+            meta_instruction="""A chat between a curious human and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the human's questions.""",  # noqa: E501
+            **kwargs):
+        super().__init__(meta_instruction=meta_instruction, **kwargs)
+
+    def get_prompt(self, prompt, sequence_start=True):
+        return super().get_prompt(prompt, sequence_start)[:-1]
+
+    def messages2prompt(self, messages, sequence_start=True):
+        return super().messages2prompt(messages, sequence_start)[:-1]
+
+    @classmethod
+    def match(cls, model_path: str) -> Optional[str]:
+        """Return the model_name that was registered to MODELS.
+
+        Args:
+            model_path (str): the model path used for matching.
+        """
+        path = model_path.lower()
+        if 'llava' in path and 'v1' in path and 'v1.6-34b' not in path \
+            and 'mistral' not in path:
+            return 'llava-v1'
+        elif 'llava-1.5' in path:
+            return 'llava-v1'
 
 
 @MODELS.register_module(name='mini-gemini-vicuna')
@@ -444,7 +531,7 @@ class InternLM2Chat7B(InternLMChat7B):
                        environment=self.eoenv)
         name_map = dict(plugin=self.plugin, interpreter=self.interpreter)
         ret = ''
-        if self.meta_instruction is not None:
+        if self.meta_instruction is not None and sequence_start:
             if len(messages) and messages[0]['role'] != 'system':
                 ret += f'{self.system}{self.meta_instruction}{self.eosys}'
         for message in messages:
@@ -476,6 +563,9 @@ class InternVLInternLM2Chat(InternLM2Chat7B):
         """
         path = model_path.lower()
         if 'internvl' in path and 'v1-5' in path:
+            if 'mini' in path and '4b' in path:
+                # use internvl-phi3 template
+                return None
             return 'internvl-internlm2'
 
 
@@ -863,7 +953,8 @@ class ChatGLM2(BaseModel):
         Args:
             model_path (str): the model path used for matching.
         """
-        if 'chatglm' in model_path.lower():
+        path = model_path.lower()
+        if 'chatglm' in path and 'chatglm3' not in path:
             return 'chatglm'
 
 
@@ -1016,10 +1107,11 @@ class MistralChat(BaseChatTemplate):
         Args:
             model_path (str): the model path used for matching.
         """
-        if 'instruct' in model_path.lower():
-            if 'mistral' in model_path.lower():
+        model_path = model_path.lower()
+        if 'instruct' in model_path or 'llava' in model_path:
+            if 'mistral' in model_path:
                 return 'mistral'
-            if 'mixtral' in model_path.lower():
+            if 'mixtral' in model_path:
                 return 'mixtral'
 
 
@@ -1133,6 +1225,7 @@ class DeepseekVL(BaseChatTemplate):
             eoh='\n\n',
             assistant='Assistant: ',
             eoa='<｜end▁of▁sentence｜>',
+            session_len=16384,
             **kwargs):
         super().__init__(meta_instruction=meta_instruction,
                          eosys=eosys,
@@ -1140,7 +1233,14 @@ class DeepseekVL(BaseChatTemplate):
                          eoh=eoh,
                          assistant=assistant,
                          eoa=eoa,
+                         session_len=session_len,
                          **kwargs)
+
+    def get_prompt(self, prompt, sequence_start=True):
+        return super().get_prompt(prompt, sequence_start)[:-1]
+
+    def messages2prompt(self, messages, sequence_start=True):
+        return super().messages2prompt(messages, sequence_start)[:-1]
 
     @classmethod
     def match(cls, model_path: str) -> Optional[str]:
@@ -1291,12 +1391,12 @@ class ChatmlDirect(BaseChatTemplate):
     def __init__(self,
                  system='<|im_start|>system\n',
                  meta_instruction='Answer the questions.',
-                 eosys='<|im_end|>\n',
+                 eosys='<|im_end|>',
                  user='<|im_start|>user\n',
-                 eoh='<|im_end|>\n',
+                 eoh='<|im_end|>',
                  assistant='<|im_start|>assistant\n',
                  eoa='<|im_end|>',
-                 separator='\n',
+                 separator='',
                  session_len=4096,
                  **kwargs):
         super().__init__(system,
@@ -1324,6 +1424,145 @@ class ChatmlDirect(BaseChatTemplate):
             return 'internvl-zh-hermes2'
 
 
+@MODELS.register_module(name='phi-3')
+class Phi3Instruct(BaseChatTemplate):
+    """Chat template of InternLM model."""
+
+    def __init__(self,
+                 system='<|system|>\n',
+                 meta_instruction=None,
+                 eosys='<|end|>\n',
+                 user='<|user|>\n',
+                 eoh='<|end|>\n',
+                 assistant='<|assistant|>\n',
+                 eoa='<|end|>\n',
+                 separator='\n',
+                 stop_words=['<|end|>', '<|endoftext|>'],
+                 **kwargs):
+        super().__init__(system=system,
+                         meta_instruction=meta_instruction,
+                         eosys=eosys,
+                         user=user,
+                         eoh=eoh,
+                         assistant=assistant,
+                         eoa=eoa,
+                         separator=separator,
+                         stop_words=stop_words,
+                         **kwargs)
+
+    @classmethod
+    def match(cls, model_path: str) -> Optional[str]:
+        """Return the model_name that was registered to MODELS.
+
+        Args:
+            model_path (str): the model path used for matching.
+        """
+        path = model_path.lower()
+        if all([c in path for c in ['phi-3', 'instruct']]):
+            return 'phi-3'
+
+
+@MODELS.register_module(name='glm4')
+@MODELS.register_module(name='chatglm3')
+class Glm4Chat(BaseChatTemplate):
+    """Chat template of InternLM model."""
+
+    def __init__(self,
+                 system='<|system|>\n',
+                 meta_instruction=None,
+                 eosys='',
+                 user='<|user|>\n',
+                 eoh='',
+                 assistant='<|assistant|>\n',
+                 eoa='',
+                 separator='',
+                 stop_words=['<|user|>', '<|endoftext|>', '<|observation|>'],
+                 **kwargs):
+        super().__init__(system=system,
+                         meta_instruction=meta_instruction,
+                         eosys=eosys,
+                         user=user,
+                         eoh=eoh,
+                         assistant=assistant,
+                         eoa=eoa,
+                         separator=separator,
+                         stop_words=stop_words,
+                         **kwargs)
+        self.start = '[gMASK]<sop>'
+
+    def get_prompt(self, prompt, sequence_start=True):
+        """Return the prompt that is concatenated with other elements in the
+        chat template.
+
+        Args:
+            prompt (str): user's input prompt
+            sequence_start (bool): indicator for the first round chat of a
+               session sequence
+        Returns:
+            str: the concatenated prompt
+        """
+        prompt = super(Glm4Chat, self).get_prompt(prompt, sequence_start)
+        if sequence_start:
+            prompt = self.start + prompt
+        return prompt
+
+    def messages2prompt(self, messages, sequence_start=True):
+        """Return the prompt that is concatenated with other elements in the
+        chat template.
+
+        Args:
+            messages (str | List): user's input prompt
+        Returns:
+            str: the concatenated prompt
+        """
+        if isinstance(messages, str):
+            return self.get_prompt(messages, sequence_start)
+        return self.start + super(Glm4Chat, self).messages2prompt(
+            messages, sequence_start)
+
+    @classmethod
+    def match(cls, model_path: str) -> Optional[str]:
+        """Return the model_name that was registered to MODELS.
+
+        Args:
+            model_path (str): the model path used for matching.
+        """
+        path = model_path.lower()
+        if 'glm-4' in path or 'chatglm3' in path:
+            return 'glm4'
+
+
+@MODELS.register_module(name='internvl-phi3')
+class InternVLPhi3(Phi3Instruct):
+    """Chat template of InternVL Chat 4B model."""
+
+    def __init__(
+            self,
+            meta_instruction='You are an AI assistant whose name is Phi-3.',
+            eosys='<|end|>',
+            eoh='<|end|>',
+            eoa='<|end|>',
+            separator='',
+            **kwargs):
+        super().__init__(meta_instruction=meta_instruction,
+                         eosys=eosys,
+                         eoh=eoh,
+                         eoa=eoa,
+                         separator=separator,
+                         **kwargs)
+
+    @classmethod
+    def match(cls, model_path: str) -> Optional[str]:
+        """Return the model_name that was registered to MODELS.
+
+        Args:
+            model_path (str): the model path used for matching.
+        """
+        path = model_path.lower()
+        if all([c in path for c in ['mini-internvl-chat', '4b', 'v1-5']]):
+            return 'internvl-phi3'
+
+
 def best_match_model(query: str) -> Optional[str]:
     """Get the model that matches the query.
 
@@ -1331,16 +1570,9 @@ def best_match_model(query: str) -> Optional[str]:
         query (str): the input query. Could be a model path.
 
     Return:
-        str | None: the possible model name or none.
+        str: the possible model name.
     """
     for name, model in MODELS.module_dict.items():
         if model.match(query):
             return model.match(query)
-    try:
-        from transformers import AutoTokenizer
-        tokenizer_config = AutoTokenizer.from_pretrained(
-            query, trust_remote_code=True)
-        if tokenizer_config.chat_template is None:
-            return 'base'
-    except Exception as e:
-        assert type(e) == OSError
+    return 'base'
