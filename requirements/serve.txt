@@ -1,4 +1,4 @@
-gradio<4.0.0
+gradio
 protobuf
 tritonclient[grpc]
 prometheus_fastapi_instrumentator
