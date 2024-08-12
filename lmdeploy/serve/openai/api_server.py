@@ -37,6 +37,9 @@ logger = get_logger('lmdeploy')
 # body logger
 def body_logger(request, raw_request: Request, start_time: float, resp=None):
     request_body = request.model_dump_json()
+    # check if resp has model_dump_json method, if so, log it
+    if resp is not None and hasattr(resp, 'model_dump_json'):
+        resp = resp.model_dump_json()
     process_time = time.time() - start_time
     request_id = raw_request.headers.get('X-NADP-RequestID')
     logger.info(
