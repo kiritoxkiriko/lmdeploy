@@ -1,6 +1,6 @@
 ARG VERSION=v0.5.3
 
-FROM openmmlab/lmdeploy:${VERSION}
+FROM openmmlab/lmdeploy:${VERSION}-cu12
 
 #ENV PIP_INDEX_URL=https://mirrors.ustc.edu.cn/pypi/web/simple
 
