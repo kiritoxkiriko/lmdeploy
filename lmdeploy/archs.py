@@ -4,8 +4,6 @@ from typing import Literal, Optional, Union
 
 from transformers import AutoConfig
 
-from lmdeploy.utils import get_hf_config_content
-
 from .messages import PytorchEngineConfig, TurbomindEngineConfig
 from .utils import get_logger
 
@@ -122,7 +120,8 @@ def check_vl_llm(config: dict) -> bool:
         'CogVLMForCausalLM', 'InternLMXComposer2ForCausalLM',
         'InternVLChatModel', 'MiniGeminiLlamaForCausalLM',
         'MGMLlamaForCausalLM', 'MiniCPMV', 'LlavaForConditionalGeneration',
-        'LlavaNextForConditionalGeneration', 'Phi3VForCausalLM'
+        'LlavaNextForConditionalGeneration', 'Phi3VForCausalLM',
+        'Qwen2VLForConditionalGeneration'
     ])
     if arch == 'QWenLMHeadModel' and 'visual' in config:
         return True
@@ -142,8 +141,8 @@ def get_task(model_path: str):
     if os.path.exists(os.path.join(model_path, 'triton_models', 'weights')):
         # workspace model
         return 'llm', AsyncEngine
-    config = get_hf_config_content(model_path)
-    if check_vl_llm(config):
+    _, config = get_model_arch(model_path)
+    if check_vl_llm(config.to_dict()):
         from lmdeploy.serve.vl_async_engine import VLAsyncEngine
         return 'vlm', VLAsyncEngine
 
@@ -159,13 +158,16 @@ def get_model_arch(model_path: str):
     """
     if os.path.exists(os.path.join(model_path, 'triton_models', 'weights')):
         # the turbomind model
-        import configparser
+        import yaml
         config_file = os.path.join(model_path, 'triton_models', 'weights',
-                                   'config.ini')
-        config = configparser.ConfigParser()
-        config.read(config_file)
-        model_arch = config['llama']['model_arch']
-        return model_arch, None
+                                   'config.yaml')
+        with open(config_file, 'r') as f:
+            config = yaml.safe_load(f)
+
+        from .turbomind.deploy.config import TurbomindModelConfig
+        tm_config = TurbomindModelConfig.from_dict(config)
+
+        return tm_config.model_config.model_arch, tm_config
     else:
         # transformers model
         try:

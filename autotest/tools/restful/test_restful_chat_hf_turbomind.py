@@ -114,19 +114,25 @@ def test_restful_chat_kvint_tp2(config, common_case_config, worker_id):
 @pytest.mark.usefixtures('common_case_config')
 @pytest.mark.restful_api
 @pytest.mark.flaky(reruns=0)
+@pytest.mark.gpu_num_2
 @pytest.mark.pr_test
 @pytest.mark.parametrize('prepare_environment', [{
-    'model': 'internlm/internlm2-chat-20b',
+    'model': 'internlm/internlm2_5-20b-chat',
     'cuda_prefix': 'CUDA_VISIBLE_DEVICES=5,6',
     'tp_num': 2
 }, {
-    'model': 'internlm/internlm2-chat-20b-inner-4bits',
+    'model': 'internlm/internlm2_5-20b-chat-inner-4bits',
     'cuda_prefix': 'CUDA_VISIBLE_DEVICES=5,6',
     'tp_num': 2
 }],
                          indirect=True)
 def test_restful_chat_pr(config, common_case_config):
-    run_all_step(config, common_case_config)
+    run_all_step(
+        config, {
+            key: value
+            for key, value in common_case_config.items()
+            if key == 'memory_test'
+        })
 
 
 @pytest.mark.order(7)

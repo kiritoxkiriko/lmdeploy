@@ -1,7 +1,9 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+from lmdeploy.utils import get_max_batch_size
+
 from .cli import CLI
 from .utils import (ArgumentHelper, DefaultsAndTypesHelpFormatter,
-                    convert_args, get_lora_adapters)
+                    convert_args, get_chat_template, get_lora_adapters)
 
 
 class SubCliServe:
@@ -46,37 +48,40 @@ class SubCliServe:
 
         # common args
         ArgumentHelper.backend(parser)
+        ArgumentHelper.max_log_len(parser)
+
         # model args
         ArgumentHelper.revision(parser)
         ArgumentHelper.download_dir(parser)
 
         # chat template args
-        ArgumentHelper.meta_instruction(parser)  # TODO remove
         ArgumentHelper.chat_template(parser)
-        ArgumentHelper.cap(parser)
 
         # pytorch engine args
         pt_group = parser.add_argument_group('PyTorch engine arguments')
 
         # common engine args
+        dtype_act = ArgumentHelper.dtype(pt_group)
         tp_act = ArgumentHelper.tp(pt_group)
-        model_name_act = ArgumentHelper.model_name(pt_group)
+        ArgumentHelper.device(pt_group)
         session_len_act = ArgumentHelper.session_len(pt_group)
         max_batch_size_act = ArgumentHelper.max_batch_size(pt_group)
         cache_max_entry_act = ArgumentHelper.cache_max_entry_count(pt_group)
         cache_block_seq_len_act = ArgumentHelper.cache_block_seq_len(pt_group)
         prefix_caching_act = ArgumentHelper.enable_prefix_caching(pt_group)
-
+        max_prefill_token_num_act = ArgumentHelper.max_prefill_token_num(
+            pt_group)
         # turbomind args
         tb_group = parser.add_argument_group('TurboMind engine arguments')
         # common engine args
+        tb_group._group_actions.append(dtype_act)
         tb_group._group_actions.append(tp_act)
-        tb_group._group_actions.append(model_name_act)
         tb_group._group_actions.append(session_len_act)
         tb_group._group_actions.append(max_batch_size_act)
         tb_group._group_actions.append(cache_max_entry_act)
         tb_group._group_actions.append(cache_block_seq_len_act)
         tb_group._group_actions.append(prefix_caching_act)
+        tb_group._group_actions.append(max_prefill_token_num_act)
         ArgumentHelper.model_format(tb_group)
         ArgumentHelper.quant_policy(tb_group)
         ArgumentHelper.rope_scaling_factor(tb_group)
@@ -129,20 +134,20 @@ class SubCliServe:
                             type=str,
                             default=['*'],
                             help='A list of allowed http headers for cors')
-        parser.add_argument('--qos-config-path',
+        parser.add_argument('--proxy-url',
                             type=str,
-                            default='',
-                            help='Qos policy config path')
+                            default=None,
+                            help='The proxy url for api server.')
         # common args
         ArgumentHelper.backend(parser)
         ArgumentHelper.log_level(parser)
         ArgumentHelper.api_keys(parser)
         ArgumentHelper.ssl(parser)
+        ArgumentHelper.model_name(parser)
+        ArgumentHelper.max_log_len(parser)
 
         # chat template args
-        ArgumentHelper.meta_instruction(parser)  # TODO remove
         ArgumentHelper.chat_template(parser)
-        ArgumentHelper.cap(parser)
 
         # model args
         ArgumentHelper.revision(parser)
@@ -152,25 +157,28 @@ class SubCliServe:
         pt_group = parser.add_argument_group('PyTorch engine arguments')
 
         ArgumentHelper.adapters(pt_group)
+        ArgumentHelper.device(pt_group)
         # common engine args
+        dtype_act = ArgumentHelper.dtype(pt_group)
         tp_act = ArgumentHelper.tp(pt_group)
-        model_name_act = ArgumentHelper.model_name(pt_group)
         session_len_act = ArgumentHelper.session_len(pt_group)
         max_batch_size_act = ArgumentHelper.max_batch_size(pt_group)
         cache_max_entry_act = ArgumentHelper.cache_max_entry_count(pt_group)
         cache_block_seq_len_act = ArgumentHelper.cache_block_seq_len(pt_group)
         prefix_caching_act = ArgumentHelper.enable_prefix_caching(pt_group)
-
+        max_prefill_token_num_act = ArgumentHelper.max_prefill_token_num(
+            pt_group)
         # turbomind args
         tb_group = parser.add_argument_group('TurboMind engine arguments')
         # common engine args
+        tb_group._group_actions.append(dtype_act)
         tb_group._group_actions.append(tp_act)
-        tb_group._group_actions.append(model_name_act)
         tb_group._group_actions.append(session_len_act)
         tb_group._group_actions.append(max_batch_size_act)
         tb_group._group_actions.append(cache_max_entry_act)
         tb_group._group_actions.append(cache_block_seq_len_act)
         tb_group._group_actions.append(prefix_caching_act)
+        tb_group._group_actions.append(max_prefill_token_num_act)
         ArgumentHelper.model_format(tb_group)
         ArgumentHelper.quant_policy(tb_group)
         ArgumentHelper.rope_scaling_factor(tb_group)
@@ -201,13 +209,40 @@ class SubCliServe:
         ArgumentHelper.session_id(parser)
 
     @staticmethod
+    def add_parser_proxy():
+        """Add parser for proxy server command."""
+        parser = SubCliServe.subparsers.add_parser(
+            'proxy',
+            formatter_class=DefaultsAndTypesHelpFormatter,
+            description=SubCliServe.proxy.__doc__,
+            help=SubCliServe.proxy.__doc__)
+        parser.set_defaults(run=SubCliServe.proxy)
+        parser.add_argument('--server-name',
+                            type=str,
+                            default='0.0.0.0',
+                            help='Host ip for proxy serving')
+        parser.add_argument('--server-port',
+                            type=int,
+                            default=8000,
+                            help='Server port of the proxy')
+        parser.add_argument(
+            '--strategy',
+            type=str,
+            choices=['random', 'min_expected_latency', 'min_observed_latency'],
+            default='min_expected_latency',
+            help='the strategy to dispatch requests to nodes')
+        ArgumentHelper.api_keys(parser)
+        ArgumentHelper.ssl(parser)
+
+    @staticmethod
     def gradio(args):
         """Serve LLMs with web UI using gradio."""
         from lmdeploy.archs import autoget_backend
         from lmdeploy.messages import (PytorchEngineConfig,
                                        TurbomindEngineConfig)
-        from lmdeploy.model import ChatTemplateConfig
         from lmdeploy.serve.gradio.app import run
+        max_batch_size = args.max_batch_size if args.max_batch_size \
+            else get_max_batch_size(args.device)
         backend = args.backend
 
         if backend != 'pytorch' and ':' not in args.model_path_or_server:
@@ -215,19 +250,20 @@ class SubCliServe:
             backend = autoget_backend(args.model_path_or_server)
         if backend == 'pytorch':
             backend_config = PytorchEngineConfig(
+                dtype=args.dtype,
                 tp=args.tp,
-                model_name=args.model_name,
-                max_batch_size=args.max_batch_size,
+                max_batch_size=max_batch_size,
                 cache_max_entry_count=args.cache_max_entry_count,
                 block_size=args.cache_block_seq_len,
                 session_len=args.session_len,
                 enable_prefix_caching=args.enable_prefix_caching,
-            )
+                device_type=args.device,
+                max_prefill_token_num=args.max_prefill_token_num)
         else:
             backend_config = TurbomindEngineConfig(
-                model_name=args.model_name,
+                dtype=args.dtype,
                 tp=args.tp,
-                max_batch_size=args.max_batch_size,
+                max_batch_size=max_batch_size,
                 session_len=args.session_len,
                 model_format=args.model_format,
                 quant_policy=args.quant_policy,
@@ -235,28 +271,24 @@ class SubCliServe:
                 cache_max_entry_count=args.cache_max_entry_count,
                 cache_block_seq_len=args.cache_block_seq_len,
                 enable_prefix_caching=args.enable_prefix_caching,
-            )
-        chat_template_config = ChatTemplateConfig(
-            model_name=args.model_name,
-            meta_instruction=args.meta_instruction,
-            capability=args.cap)
-        if args.chat_template:
-            chat_template_config = ChatTemplateConfig.from_json(
-                args.chat_template)
+                max_prefill_token_num=args.max_prefill_token_num)
+        chat_template_config = get_chat_template(args.chat_template)
         run(args.model_path_or_server,
             server_name=args.server_name,
             server_port=args.server_port,
             backend=backend,
             backend_config=backend_config,
             chat_template_config=chat_template_config,
-            share=args.share)
+            share=args.share,
+            max_log_len=args.max_log_len)
 
     @staticmethod
     def api_server(args):
         """Serve LLMs with restful api using fastapi."""
         from lmdeploy.archs import autoget_backend
-        from lmdeploy.model import ChatTemplateConfig
         from lmdeploy.serve.openai.api_server import serve as run_api_server
+        max_batch_size = args.max_batch_size if args.max_batch_size \
+            else get_max_batch_size(args.device)
         backend = args.backend
         if backend != 'pytorch':
             # set auto backend mode
@@ -266,21 +298,22 @@ class SubCliServe:
             from lmdeploy.messages import PytorchEngineConfig
             adapters = get_lora_adapters(args.adapters)
             backend_config = PytorchEngineConfig(
+                dtype=args.dtype,
                 tp=args.tp,
-                model_name=args.model_name,
-                max_batch_size=args.max_batch_size,
+                max_batch_size=max_batch_size,
                 cache_max_entry_count=args.cache_max_entry_count,
                 block_size=args.cache_block_seq_len,
                 session_len=args.session_len,
                 adapters=adapters,
                 enable_prefix_caching=args.enable_prefix_caching,
-            )
+                device_type=args.device,
+                max_prefill_token_num=args.max_prefill_token_num)
         else:
             from lmdeploy.messages import TurbomindEngineConfig
             backend_config = TurbomindEngineConfig(
-                model_name=args.model_name,
+                dtype=args.dtype,
                 tp=args.tp,
-                max_batch_size=args.max_batch_size,
+                max_batch_size=max_batch_size,
                 session_len=args.session_len,
                 model_format=args.model_format,
                 quant_policy=args.quant_policy,
@@ -288,11 +321,9 @@ class SubCliServe:
                 cache_max_entry_count=args.cache_max_entry_count,
                 cache_block_seq_len=args.cache_block_seq_len,
                 enable_prefix_caching=args.enable_prefix_caching,
-            )
-        chat_template_config = None
-        if args.chat_template:
-            chat_template_config = ChatTemplateConfig.from_json(
-                args.chat_template)
+                max_prefill_token_num=args.max_prefill_token_num)
+        chat_template_config = get_chat_template(args.chat_template)
+
         from lmdeploy.messages import VisionConfig
         vision_config = VisionConfig(args.vision_max_batch_size)
         run_api_server(args.model_path,
@@ -310,7 +341,8 @@ class SubCliServe:
                        log_level=args.log_level.upper(),
                        api_keys=args.api_keys,
                        ssl=args.ssl,
-                       qos_config_path=args.qos_config_path)
+                       proxy_url=args.proxy_url,
+                       max_log_len=args.max_log_len)
 
     @staticmethod
     def api_client(args):
@@ -320,7 +352,15 @@ class SubCliServe:
         run_api_client(**kwargs)
 
     @staticmethod
+    def proxy(args):
+        """Proxy server that manages distributed api_server nodes."""
+        from lmdeploy.serve.proxy.proxy import proxy
+        kwargs = convert_args(args)
+        proxy(**kwargs)
+
+    @staticmethod
     def add_parsers():
         SubCliServe.add_parser_gradio()
         SubCliServe.add_parser_api_server()
         SubCliServe.add_parser_api_client()
+        SubCliServe.add_parser_proxy()

@@ -3,9 +3,9 @@ import os
 import random
 
 from lmdeploy.archs import get_model_arch
-from lmdeploy.messages import EngineGenerationConfig, TurbomindEngineConfig
-from lmdeploy.model import MODELS, ChatTemplateConfig, best_match_model
-from lmdeploy.serve.async_engine import deduce_a_name
+from lmdeploy.messages import GenerationConfig, TurbomindEngineConfig
+from lmdeploy.model import ChatTemplateConfig
+from lmdeploy.serve.async_engine import get_names_from_model
 from lmdeploy.tokenizer import DetokenizeState
 from lmdeploy.utils import _get_and_verify_max_len, _stop_words
 
@@ -29,15 +29,14 @@ def input_prompt(model_name):
 
 
 def main(model_path: str,
-         model_name: str = None,
          session_id: int = 1,
          top_k: float = 40,
          top_p: float = 0.8,
          temperature: float = 0.8,
          repetition_penalty: float = 1.0,
          cap: str = 'chat',
+         dtype: str = 'auto',
          tp: int = 1,
-         max_batch_size: int = 1,
          model_format: str = None,
          quant_policy: int = 0,
          cache_max_entry_count: float = 0.8,
@@ -54,35 +53,39 @@ def main(model_path: str,
 
     Args:
         model_path (str): the path of the deployed model
-        model_name (str): the name of deployed model
         session_id (int): the identical id of a session
         top_k (int): sampling top k.
         top_p (int): sampling top p.
         temperature (float): sampling temperature.
         repetition_penalty (float): parameter to penalize repetition
-        cap (str): the capability of a model. For example, codellama has the ability among ['completion', 'infilling', 'chat', 'python']
+        cap (str): the capability of a model. For example, codellama has the
+            ability among ['completion', 'infilling', 'chat', 'python']
+        dtype (str): data type for model weights and activations. It can be
+            one of the following values, ['auto', 'float16', 'bfloat16']
+            The `auto` option will use FP16 precision for FP32 and FP16
+            models, and BF16 precision for BF16 models.
         tp (int): GPU number used in tensor parallelism
-        max_batch_size (int): max batch size
-        model_format (str): the layout of the deployed model. It can be one of the following values [hf, llama, awq]
-        quant_policy (int): default to 0. When k/v is quantized into 8 bit, set it to 4
-        cache_max_entry_count (float): the percentage of gpu memory occupied by the k/v cache.
-        cache_block_seq_len (int): the length of the token sequence in a k/v block, default to 64
-        rope_scaling_factor (float): scaling factor used for dynamic ntk, default to 0. TurboMind follows the implementation of transformer LlamaAttention
+        model_format (str): the layout of the deployed model. It can be one
+            of the following values [hf, llama, awq]
+        quant_policy (int): default to 0. When k/v is quantized into 4 or 8
+            bit, set it to 4 or 8, respectively
+        cache_max_entry_count (float): the percentage of gpu memory occupied
+            by the k/v cache.
+        cache_block_seq_len (int): the length of the token sequence in a k/v
+            block, default to 64
+        rope_scaling_factor (float): scaling factor used for dynamic ntk,
+            default to 0. TurboMind follows the implementation of transformer
+            LlamaAttention
         enable_prefix_caching (bool): whether enable prefix caching
         session_len (int): the length input output tokens
         stream_output (bool): indicator for streaming output or not
         request_output_len (int): output token nums
         chat_template_config (ChatTemplateConfig): chat template config
         kwargs (dict): unused args
-    """ # noqa: E 501
+    """
 
     # chat template
-    model_name = deduce_a_name(model_path, model_name, None,
-                               chat_template_config)
-    if model_name in MODELS.module_dict.keys():
-        chat_template_name = model_name
-    else:
-        chat_template_name = best_match_model(model_path)
+    _, chat_template_name = get_names_from_model(model_path)
     if chat_template_config is None:
         chat_template_config = ChatTemplateConfig(chat_template_name)
     elif chat_template_config.model_name is None:
@@ -93,12 +96,11 @@ def main(model_path: str,
     model = chat_template_config.chat_template
 
     _, model_config = get_model_arch(model_path)
-    session_len = _get_and_verify_max_len(model_config, None)
+    session_len = _get_and_verify_max_len(model_config, session_len)
 
     # engine
     engine_cfg = TurbomindEngineConfig(
-        max_batch_size=max_batch_size,
-        model_name=model_name,
+        max_batch_size=1,
         model_format=model_format,
         session_len=session_len,
         cache_max_entry_count=cache_max_entry_count,
@@ -106,6 +108,7 @@ def main(model_path: str,
         enable_prefix_caching=enable_prefix_caching,
         quant_policy=quant_policy,
         rope_scaling_factor=rope_scaling_factor,
+        dtype=dtype,
         tp=tp)
     print('engine_cfg:\n', engine_cfg, sep='', flush=True)
 
@@ -120,18 +123,18 @@ def main(model_path: str,
     if stop_words is not None:
         stop_words = stop_words[0][0].tolist()
 
-    gen_config = EngineGenerationConfig(max_new_tokens=request_output_len,
-                                        top_k=top_k,
-                                        top_p=top_p,
-                                        temperature=temperature,
-                                        repetition_penalty=repetition_penalty,
-                                        stop_words=stop_words)
+    gen_config = GenerationConfig(max_new_tokens=request_output_len,
+                                  top_k=top_k,
+                                  top_p=top_p,
+                                  temperature=temperature,
+                                  repetition_penalty=repetition_penalty,
+                                  stop_token_ids=stop_words)
 
     nth_round = 1
     step = 0
     seed = random.getrandbits(64)
     while True:
-        prompt = input_prompt(model_name)
+        prompt = input_prompt(chat_template_name)
         if prompt == 'exit':
             exit(0)
         elif prompt == 'end':
@@ -147,7 +150,6 @@ def main(model_path: str,
             if model.capability == 'chat':
                 sequence_start = (nth_round == 1)
                 sequence_end = False
-                step = step
             else:
                 sequence_start = True
                 sequence_end = True

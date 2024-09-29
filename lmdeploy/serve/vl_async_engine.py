@@ -3,6 +3,7 @@ from typing import Dict, List, Optional, Union
 
 import numpy as np
 
+from lmdeploy.pytorch.check_env import try_import_deeplink
 from lmdeploy.serve.async_engine import AsyncEngine
 from lmdeploy.utils import get_logger
 from lmdeploy.vl.constants import IMAGE_DUMMY_TOKEN_INDEX, IMAGE_TOKEN
@@ -18,6 +19,8 @@ class VLAsyncEngine(AsyncEngine):
     def __init__(self, model_path: str, **kwargs) -> None:
         vision_config = kwargs.pop('vision_config', None)
         backend_config = kwargs.get('backend_config', None)
+        if kwargs.get('backend', '') == 'pytorch':
+            try_import_deeplink(backend_config.device_type)
         self.vl_encoder = ImageEncoder(model_path,
                                        vision_config,
                                        backend_config=backend_config)
@@ -60,16 +63,29 @@ class VLAsyncEngine(AsyncEngine):
 
         results = {}
         input_ids = []
+        from lmdeploy.vl.templates import Qwen2VLChatTemplateWrapper
+        ranges = None
+        grid_thws = None
         if len(segs) > 1:
-            images = await self.vl_prompt_template.async_collect_pil_images(
-                prompt)
-            features = await self.vl_encoder.async_infer(images)
+            # yapf: disable
+            images_with_kwargs = await self.vl_prompt_template.async_collect_pil_images(prompt)  # noqa: E501
+            # yapf: enable
+            features = []
+            if len(images_with_kwargs) > 0:
+                images, image_kwargs = list(zip(*images_with_kwargs))
+                features = await self.vl_encoder.async_infer(
+                    images, image_kwargs)
 
-            from lmdeploy.vl.templates import MiniCPMVTempateWrapper
-            if isinstance(self.vl_prompt_template, MiniCPMVTempateWrapper):
-                decorated, features = self.vl_prompt_template.update_image_token(  # noqa: E501
-                    decorated, features)
-                segs = decorated.split(IMAGE_TOKEN)
+                from lmdeploy.vl.templates import MiniCPMVTempateWrapper
+                if isinstance(self.vl_prompt_template, MiniCPMVTempateWrapper):
+                    decorated, features = self.vl_prompt_template.update_image_token(  # noqa: E501
+                        decorated, features)
+                    segs = decorated.split(IMAGE_TOKEN)
+
+                if isinstance(self.vl_prompt_template,
+                              Qwen2VLChatTemplateWrapper):
+                    grid_thws = [x['grid_thw'] for x in features]
+                    features = [x['embeddings'] for x in features]
 
             features = [x.cpu().numpy() for x in features]
             input_ids = []
@@ -91,11 +107,20 @@ class VLAsyncEngine(AsyncEngine):
                                                          and sequence_start))
                 input_ids.extend(seg_ids)
             ranges = np.stack([begins, ends], axis=1).tolist()
-            results['input_embeddings'] = features
-            results['input_embedding_ranges'] = ranges
+            results['input_embeddings'] = features or None
+            results['input_embedding_ranges'] = ranges or None
         else:
             input_ids = self.tokenizer.encode(decorated,
                                               add_bos=sequence_start)
+
+        if isinstance(self.vl_prompt_template, Qwen2VLChatTemplateWrapper):
+            # TODO: refactor _get_prompt_input function
+            mrope_position_ids, mrope_position_delta = \
+                self.vl_prompt_template.get_mrope_info(
+                    len(input_ids), grid_thws=grid_thws,
+                    embedding_ranges=ranges)
+            results['mrope_position_ids'] = mrope_position_ids
+            results['mrope_position_delta'] = mrope_position_delta
 
         results['input_ids'] = input_ids
         results['prompt'] = decorated
@@ -119,7 +144,6 @@ class VLAsyncEngine(AsyncEngine):
                                       List[VLPromptType], List[List[Dict]]],
                  **kwargs):
         """Inference a batch of prompts."""
-        prompts = self._convert_prompts(prompts)
         return super().__call__(prompts, **kwargs)
 
     def chat(self, prompts: VLPromptType, **kwargs):

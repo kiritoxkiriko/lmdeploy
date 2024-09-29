@@ -9,8 +9,7 @@ from utils.get_run_config import get_model_name, get_tp_num
 from utils.rule_condition_assert import assert_result
 
 from lmdeploy import pipeline
-from lmdeploy.messages import (GenerationConfig, PytorchEngineConfig,
-                               TurbomindEngineConfig)
+from lmdeploy.messages import PytorchEngineConfig, TurbomindEngineConfig
 from lmdeploy.vl import load_image
 from lmdeploy.vl.constants import IMAGE_TOKEN
 
@@ -36,29 +35,22 @@ def run_pipeline_chat_test(config,
     elif 'pytorch_lora' == type:
         backend_config = PytorchEngineConfig(tp=tp,
                                              adapters=extra.get('adapters'))
-    elif 'kvint' in type:
-        if 'w4' in model_case or ('4bits' in model_case
-                                  or 'awq' in model_case.lower()):
-            backend_config = TurbomindEngineConfig(
-                tp=tp,
-                model_format='awq',
-                quant_policy=extra.get('quant_policy'))
-        else:
-            backend_config = TurbomindEngineConfig(
-                tp=tp, quant_policy=extra.get('quant_policy'))
-    # if llava support kvint or awq, this code should refactor
-    elif 'llava' in model_case:
-        backend_config = TurbomindEngineConfig(tp=tp, model_name='vicuna')
     else:
-        if 'w4' in model_case or ('4bits' in model_case
-                                  or 'awq' in model_case.lower()):
-            backend_config = TurbomindEngineConfig(tp=tp, model_format='awq')
-        else:
-            backend_config = TurbomindEngineConfig(tp=tp)
-    pipe = pipeline(hf_path, backend_config=backend_config)
+        backend_config = TurbomindEngineConfig(tp=tp)
 
-    # run testcases
-    gen_config = GenerationConfig(top_k=1)
+    if 'kvint' in type:
+        backend_config.quant_policy = extra.get('quant_policy')
+
+    # if llava support kvint or awq, this code should refactor
+    if 'llava' in model_case:
+        backend_config.model_name = 'vicuna'
+    if 'w4' in model_case or ('4bits' in model_case
+                              or 'awq' in model_case.lower()):
+        backend_config.model_format = 'awq'
+    if 'gptq' in model_case.lower():
+        backend_config.model_format = 'gptq'
+
+    pipe = pipeline(hf_path, backend_config=backend_config)
 
     config_log = os.path.join(
         log_path, '_'.join([
@@ -67,10 +59,12 @@ def run_pipeline_chat_test(config,
         ]))
     file = open(config_log, 'w')
     log_string = '\n'.join([
-        'reproduce config info:', 'engine_config = ' + str(backend_config),
-        'gen_config = ' + str(gen_config),
+        'reproduce config info:',
+        'from lmdeploy.messages import PytorchEngineConfig',
+        'from lmdeploy.messages import TurbomindEngineConfig',
+        'engine_config = ' + str(backend_config),
         'pipe = pipeline("' + hf_path + '",  backend_config=engine_config)',
-        'res = pipe("Hi, pls introduce shanghai", gen_config=gen_config)'
+        'res = pipe("Hi, pls introduce shanghai")'
     ])
     file.writelines(log_string)
     print(log_string)
@@ -95,7 +89,7 @@ def run_pipeline_chat_test(config,
             prompts.append({'role': 'user', 'content': prompt})
             file.writelines('prompt:' + prompt + '\n')
 
-            response = pipe([prompts], gen_config=gen_config)[0].text
+            response = pipe([prompts])[0].text
 
             case_result, reason = assert_result(response,
                                                 prompt_detail.values(),
@@ -149,7 +143,7 @@ def assert_pipeline_chat_log(config,
                         result = False
                         msg = line
                         break
-                    if 'result:True, reason:' in line and result is False:
+                    if 'result:True, reason:' in line and not result:
                         result = True
                         msg = ''
 
@@ -187,7 +181,7 @@ def assert_pipeline_common_log(config, log_name):
                 result = False
                 msg = line
                 break
-            if 'result:True, reason:' in line and result is False:
+            if 'result:True, reason:' in line and not result:
                 result = True
                 msg = ''
     subprocess.run([' '.join(['rm -rf', config_log])],
@@ -216,15 +210,15 @@ def assert_pipeline_batch_return(output, size: int = 1):
         return False, 'length is not correct'
     for single_output in output:
         result, msg = assert_pipeline_single_return(single_output)
-        if result is False:
+        if not result:
             return result, msg
     return True, ''
 
 
 def assert_pipeline_single_stream_return(output, logprobs_num: int = 0):
     for i in range(0, len(output) - 1):
-        if assert_pipeline_single_element(
-                output[i], is_stream=True, logprobs_num=logprobs_num) is False:
+        if not assert_pipeline_single_element(
+                output[i], is_stream=True, logprobs_num=logprobs_num):
             return False, f'single_stream_element is false, index is {i}'
     if assert_pipeline_single_element(
             output[-1], is_stream=True, is_last=True,
@@ -237,7 +231,7 @@ def assert_pipeline_batch_stream_return(output, size: int = 1):
     for i in range(size):
         output_list = [item for item in output if item.session_id == i]
         result, msg = assert_pipeline_single_stream_return(output_list)
-        if result is False:
+        if not result:
             return result, msg
     return True, ''
 
@@ -261,7 +255,7 @@ def assert_pipeline_single_element(output,
         result &= len(output.text) > 0
         result &= output.finish_reason is None
         result &= len(output.token_ids) > 0
-    if logprobs_num == 0 or is_last:
+    if logprobs_num == 0 or (is_last and is_stream):
         result &= output.logprobs is None
     else:
         if is_stream:
@@ -295,6 +289,8 @@ def run_pipeline_vl_chat_test(config, model_case):
                                                model_name='vicuna')
     else:
         backend_config = TurbomindEngineConfig(tp=tp, session_len=8192)
+    if '4bit' in model_case.lower() or 'awq' in model_case.lower():
+        backend_config.model_format = 'awq'
     pipe = pipeline(hf_path, backend_config=backend_config)
 
     pipeline_chat_log = os.path.join(
@@ -390,7 +386,7 @@ def assert_pipeline_vl_chat_log(config, model_case):
                 result = False
                 msg = line
                 break
-            if 'result:True, reason:' in line and result is False:
+            if 'result:True, reason:' in line and not result:
                 result = True
                 msg = ''
 
