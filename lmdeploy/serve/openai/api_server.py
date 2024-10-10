@@ -44,6 +44,20 @@ def body_logger(request, raw_request: Request, start_time: float, resp=None):
     logger.info(
         f'receive request: id: {request_id}, body: {request_body}, resp: {resp}, time: {process_time}')
 
+def mount_my_metrics(app: FastAPI):
+    ## add metrics
+    logger.info("Mounting my metrics")
+    from prometheus_fastapi_instrumentator import Instrumentator
+
+    prom_instrumentator = Instrumentator(
+        should_group_status_codes=False,
+        should_ignore_untemplated=True,
+        # should_respect_env_var=True,
+        excluded_handlers=[".*admin.*", "/metrics"],
+    )
+    instrumentator = prom_instrumentator.instrument(app)
+    instrumentator.expose(app, endpoint="/metrics")
+
 
 if not 'TM_LOG_LEVEL' in os.environ or os.environ['TM_LOG_LEVEL'] == '':
     os.environ['TM_LOG_LEVEL'] = 'ERROR'
@@ -89,19 +103,6 @@ async def check_api_key(
     else:
         # api_keys not set; allow all
         return None
-
-## add metrics
-from prometheus_fastapi_instrumentator import Instrumentator
-
-instrumentator = Instrumentator(
-    should_group_status_codes=False,
-    should_ignore_untemplated=True,
-    should_respect_env_var=True,
-    excluded_handlers=[".*admin.*", "/metrics"],
-).instrument(app)
-
-# expose metrics
-instrumentator.expose(app, endpoint="/metrics")
 
 
 def get_model_list():
@@ -1052,6 +1053,8 @@ def serve(model_path: str,
     if os.getenv('TM_LOG_LEVEL') is None:
         os.environ['TM_LOG_LEVEL'] = log_level
     logger.setLevel(log_level)
+
+    mount_my_metrics(app)
 
     if allow_origins:
         app.add_middleware(
