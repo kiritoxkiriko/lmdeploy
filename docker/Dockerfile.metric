@@ -4,7 +4,8 @@ FROM openmmlab/lmdeploy:${VERSION}-cu12
 
 #ENV PIP_INDEX_URL=https://mirrors.ustc.edu.cn/pypi/web/simple
 
-RUN pip install --no-cache-dir prometheus_fastapi_instrumentator
+# add qwenvl-utils
+RUN pip install --no-cache-dir prometheus_fastapi_instrumentator qwen-vl-utils
 
 ENV ENABLE_METRICS=1
 
