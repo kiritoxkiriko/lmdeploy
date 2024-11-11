@@ -9,6 +9,8 @@ RUN pip install --no-cache-dir prometheus_fastapi_instrumentator qwen-vl-utils
 
 ENV ENABLE_METRICS=1
 
+ENV ENABLE_LOG_REQUESTS=1
+
 COPY ./lmdeploy/serve/openai/api_server.py /tmp/api_server.py
 
 # add custom api_server.py to lmdeploy package dynamically by copying it to the package directory

@@ -33,8 +33,12 @@ from lmdeploy.utils import get_logger
 
 logger = get_logger('lmdeploy')
 
+ENABLE_LOG_REQUESTS = os.environ.get('ENABLE_LOG_REQUESTS', '0') == '1'
+
 # body logger
 def body_logger(request, raw_request: Request, start_time: float, resp=None):
+    if not ENABLE_LOG_REQUESTS:
+        return
     request_body = request.model_dump_json()
     # check if resp has model_dump_json method, if so, log it
     if resp is not None and hasattr(resp, 'model_dump_json'):
