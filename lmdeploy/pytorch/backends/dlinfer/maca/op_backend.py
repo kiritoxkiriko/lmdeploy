@@ -5,47 +5,18 @@ import torch
 
 from lmdeploy.utils import get_logger
 
-from ..base import OpType
-from ..default import DefaultOpsBackend
+from ..op_backend import DlinferOpsBackend
 
 logger = get_logger('lmdeploy')
 
 
-class AscendOpsBackend(DefaultOpsBackend):
-    """ascend layer backend."""
+class MacaOpsBackend(DlinferOpsBackend):
+    """maca layer backend."""
 
     @staticmethod
     def get_name() -> str:
         """backend name."""
-        return 'ascend'
-
-    @classmethod
-    def get_layer_impl_builder(cls, layer_type: OpType):
-        """get ascend layer builder."""
-        if layer_type == OpType.Attention:
-            from .attention import AscendAttentionBuilder
-            return AscendAttentionBuilder
-        elif layer_type == OpType.ApplyRotaryEmb:
-            from .apply_rotary_emb import AscendApplyRotaryEmbBuilder
-            return AscendApplyRotaryEmbBuilder
-        elif layer_type == OpType.RMSNorm:
-            from .norm import AscendRMSNormBuilder
-            return AscendRMSNormBuilder
-        elif layer_type == OpType.SoftmaxTopK:
-            from .moe import AscendSoftmaxTopKBuilder
-            return AscendSoftmaxTopKBuilder
-        elif layer_type == OpType.FusedMoE:
-            from .moe import AscendFusedMoEBuilder
-            return AscendFusedMoEBuilder
-        else:
-            logger.debug(
-                f'Op {layer_type} fallback to default implementation.')
-            return super().get_layer_impl_builder(layer_type)
-
-    @staticmethod
-    def get_attention_metadata_cls():
-        from .attention import AscendAttentionMetadata
-        return AscendAttentionMetadata
+        return 'maca'
 
     @staticmethod
     def get_k_block_shape(
@@ -54,10 +25,10 @@ class AscendOpsBackend(DefaultOpsBackend):
         head_size: int,
         dtype: torch.dtype,
     ) -> Tuple[int, ...]:
-        return (
-            block_size,
-            num_heads * head_size,
-        )
+        if head_size == 576:
+            x = 16
+            return (num_heads, head_size // x, block_size, x)
+        return (num_heads, block_size, head_size)
 
     @staticmethod
     def get_v_block_shape(
@@ -66,24 +37,22 @@ class AscendOpsBackend(DefaultOpsBackend):
         head_size: int,
         dtype: torch.dtype,
     ) -> Tuple[int, ...]:
-        return (
-            block_size,
-            num_heads * head_size,
-        )
+        return (num_heads, block_size, head_size)
 
     @classmethod
     def update_step_context(cls, step_context):
         """update step context."""
         kv_start_indices, attention_mask = [], []
-        block_num, block_size, _ = step_context.kv_caches[0][0].shape
+        block_num, _, block_size, _ = step_context.kv_caches[0][0].shape
         device = step_context.block_offsets.device
 
         is_unpaged_prefill = False
-        q_start_loc_cpu = step_context.q_start_loc.cpu()
-        q_seqlens_cpu = step_context.q_seqlens.cpu()
-        kv_seqlens_cpu = step_context.kv_seqlens.cpu()
-        max_q_seq_len = torch.max(q_seqlens_cpu).item()
-        max_kv_seq_len = torch.max(kv_seqlens_cpu).item()
+        q_start_loc = torch.cat((torch.tensor([0], device=device),
+                                 step_context.q_seqlens.cumsum(0))).int()
+        q_seqlens = step_context.q_seqlens.int()
+        kv_seqlens = step_context.kv_seqlens.int()
+        max_q_seq_len = torch.max(q_seqlens).item()
+        max_kv_seq_len = torch.max(kv_seqlens).item()
 
         if not step_context.is_decoding:
             is_unpaged_prefill = \
@@ -126,10 +95,10 @@ class AscendOpsBackend(DefaultOpsBackend):
         attn_meta_cls = cls.get_attention_metadata_cls()
         attn_metadata = attn_meta_cls(
             step_context.is_decoding,
-            step_context.block_offsets,
-            q_start_loc=q_start_loc_cpu,
-            q_seqlens=q_seqlens_cpu,
-            kv_seqlens=kv_seqlens_cpu,
+            step_context.block_offsets.int(),
+            q_start_loc=q_start_loc,
+            q_seqlens=q_seqlens,
+            kv_seqlens=kv_seqlens,
             kv_start_indices=kv_start_indices,
             block_size=block_size,
             attention_mask=attention_mask,

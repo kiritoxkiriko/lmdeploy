@@ -125,6 +125,10 @@ class Qwen2Attention(nn.Module):
             past_key_value[0],
             past_key_value[1],
             attn_metadata,
+            k_scales_zeros=None
+            if len(past_key_value) == 2 else past_key_value[2],
+            v_scales_zeros=None
+            if len(past_key_value) == 2 else past_key_value[3],
             inplace=True,
         )
         attn_output = attn_output.reshape(*hidden_states.shape[:-1], -1)
@@ -384,10 +388,11 @@ class Qwen2VLForConditionalGeneration(nn.Module, CudaGraphMixin):
             inputs_embeds=inputs_embeds,
             mrope_position_ids=mrope_position_ids,
         )
+        return hidden_states
 
-        logits = self.lm_head(hidden_states)
-        logits = logits.float()
-        return logits
+    def get_logits(self, hidden_states: torch.Tensor):
+        """compute logits of the model output."""
+        return self.lm_head(hidden_states)
 
     def update_weights(self):
         """update weights."""

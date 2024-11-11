@@ -26,6 +26,7 @@ ______________________________________________________________________
 <details open>
 <summary><b>2024</b></summary>
 
+- \[2024/10\] PyTorchEngine 在 ascend 平台上支持了图模式，推理性能提高了 1 倍
 - \[2024/09\] LMDeploy PyTorchEngine 增加了对 [华为 Ascend](docs/zh_cn/get_started/ascend/get_started.md) 的支持。支持的模型请见[这里](docs/zh_cn/supported_models/supported_models.md)
 - \[2024/09\] 通过引入 CUDA Graph，LMDeploy PyTorchEngine 在 Llama3-8B 推理上实现了 1.3 倍的加速
 - \[2024/08\] LMDeploy现已集成至 [modelscope/swift](https://github.com/modelscope/swift)，成为 VLMs 推理的默认加速引擎
@@ -116,6 +117,7 @@ LMDeploy TurboMind 引擎拥有卓越的推理能力，在各种规模的模型�
   <li>Llama2 (7B - 70B)</li>
   <li>Llama3 (8B, 70B)</li>
   <li>Llama3.1 (8B, 70B)</li>
+  <li>Llama3.2 (1B, 3B)</li>
   <li>InternLM (7B - 20B)</li>
   <li>InternLM2 (7B - 20B)</li>
   <li>InternLM2.5 (7B)</li>
@@ -162,6 +164,7 @@ LMDeploy TurboMind 引擎拥有卓越的推理能力，在各种规模的模型�
   <li>Phi-3-vision (4.2B)</li>
   <li>Phi-3.5-vision (4.2B)</li>
   <li>GLM-4V (9B)</li>
+  <li>Llama3.2-vision (11B, 90B)</li>
 </ul>
 </td>
 </tr>
@@ -199,6 +202,10 @@ print(response)
 > LMDeploy 默认从 HuggingFace 上面下载模型，如果要从 ModelScope 上面下载模型，请通过命令 `pip install modelscope` 安装ModelScope，并设置环境变量：
 >
 > `export LMDEPLOY_USE_MODELSCOPE=True`
+>
+> 如果要从 openMind Hub 上面下载模型，请通过命令 `pip install openmind_hub` 安装openMind Hub，并设置环境变量：
+>
+> `export LMDEPLOY_USE_OPENMIND_HUB=True`
 
 关于 pipeline 的更多推理参数说明，请参考[这里](docs/zh_cn/llm/pipeline.md)
 

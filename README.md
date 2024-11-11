@@ -26,7 +26,8 @@ ______________________________________________________________________
 <details open>
 <summary><b>2024</b></summary>
 
-- \[2024/09\] LMDeploy PyTorchEngine adds support for[Huawei Ascend](./docs/en/get_started/ascend/get_started.md). See supported models [here](docs/en/supported_models/supported_models.md)
+- \[2024/10\] PyTorchEngine supports graph mode on ascend platform, doubling the inference speed
+- \[2024/09\] LMDeploy PyTorchEngine adds support for [Huawei Ascend](./docs/en/get_started/ascend/get_started.md). See supported models [here](docs/en/supported_models/supported_models.md)
 - \[2024/09\] LMDeploy PyTorchEngine achieves 1.3x faster on Llama3-8B inference by introducing CUDA graph
 - \[2024/08\] LMDeploy is integrated into [modelscope/swift](https://github.com/modelscope/swift) as the default accelerator for VLMs inference
 - \[2024/07\] Support Llama3.1 8B, 70B and its TOOLS CALLING
@@ -115,6 +116,7 @@ For detailed inference benchmarks in more devices and more settings, please refe
   <li>Llama2 (7B - 70B)</li>
   <li>Llama3 (8B, 70B)</li>
   <li>Llama3.1 (8B, 70B)</li>
+  <li>Llama3.2 (1B, 3B)</li>
   <li>InternLM (7B - 20B)</li>
   <li>InternLM2 (7B - 20B)</li>
   <li>InternLM2.5 (7B)</li>
@@ -161,6 +163,7 @@ For detailed inference benchmarks in more devices and more settings, please refe
   <li>Phi-3-vision (4.2B)</li>
   <li>Phi-3.5-vision (4.2B)</li>
   <li>GLM-4V (9B)</li>
+  <li>Llama3.2-vision (11B, 90B)</li>
 </ul>
 </td>
 </tr>
@@ -199,6 +202,10 @@ print(response)
 > By default, LMDeploy downloads model from HuggingFace. If you would like to use models from ModelScope, please install ModelScope by `pip install modelscope` and set the environment variable:
 >
 > `export LMDEPLOY_USE_MODELSCOPE=True`
+>
+> If you would like to use models from openMind Hub, please install openMind Hub by `pip install openmind_hub` and set the environment variable:
+>
+> `export LMDEPLOY_USE_OPENMIND_HUB=True`
 
 For more information about inference pipeline, please refer to [here](docs/en/llm/pipeline.md).
 

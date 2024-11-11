@@ -8,7 +8,7 @@ from http import HTTPStatus
 from typing import AsyncGenerator, Dict, List, Literal, Optional, Union
 
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.security.http import HTTPAuthorizationCredentials, HTTPBearer
@@ -74,7 +74,7 @@ class VariableInterface:
     api_server_url: Optional[str] = None
 
 
-app = FastAPI(docs_url='/')
+router = APIRouter()
 get_bearer_token = HTTPBearer(auto_error=False)
 
 
@@ -117,7 +117,7 @@ def get_model_list():
     return model_names
 
 
-@app.get('/v1/models', dependencies=[Depends(check_api_key)])
+@router.get('/v1/models', dependencies=[Depends(check_api_key)])
 def available_models():
     """Show available models."""
     model_cards = []
@@ -266,7 +266,7 @@ def _create_chat_completion_logprobs(tokenizer: Tokenizer,
     return ChoiceLogprobs(content=content)
 
 
-@app.get('/health')
+@router.get('/health')
 async def health() -> Response:
     """Health check."""
     return Response(status_code=200)
@@ -306,7 +306,7 @@ def logit_bias_logits_processor(logit_bias: Union[Dict[int, float],
     return partial(_logit_bias_processor, clamped_logit_bias)
 
 
-@app.post('/v1/chat/completions', dependencies=[Depends(check_api_key)])
+@router.post('/v1/chat/completions', dependencies=[Depends(check_api_key)])
 async def chat_completions_v1(request: ChatCompletionRequest,
                               raw_request: Request = None):
     """Completion API similar to OpenAI's API.
@@ -352,6 +352,12 @@ async def chat_completions_v1(request: ChatCompletionRequest,
     - ignore_eos (bool): indicator for ignoring eos
     - skip_special_tokens (bool): Whether or not to remove special tokens
         in the decoding. Default to be True.
+    - min_new_tokens (int): To generate at least numbers of tokens.
+    - min_p (float): Minimum token probability, which will be scaled by the
+        probability of the most likely token. It must be a value between
+        0 and 1. Typical values are in the 0.01-0.2 range, comparably
+        selective as setting `top_p` in the 0.99-0.8 range (use the
+        opposite of normal `top_p` values)
 
     Currently we do not support the following features:
     - presence_penalty (replaced with repetition_penalty)
@@ -369,6 +375,7 @@ async def chat_completions_v1(request: ChatCompletionRequest,
         return create_error_response(
             HTTPStatus.BAD_REQUEST,
             f'The session_id `{request.session_id}` is occupied.')
+
     model_name = request.model
     adapter_name = None
     if model_name != VariableInterface.async_engine.model_name:
@@ -415,6 +422,8 @@ async def chat_completions_v1(request: ChatCompletionRequest,
         skip_special_tokens=request.skip_special_tokens,
         response_format=response_format,
         logits_processors=logits_processors,
+        min_new_tokens=request.min_new_tokens,
+        min_p=request.min_p,
         random_seed=random_seed)
 
     tools = None
@@ -575,7 +584,7 @@ async def chat_completions_v1(request: ChatCompletionRequest,
     return response
 
 
-@app.post('/v1/completions', dependencies=[Depends(check_api_key)])
+@router.post('/v1/completions', dependencies=[Depends(check_api_key)])
 async def completions_v1(request: CompletionRequest,
                          raw_request: Request = None):
     """Completion API similar to OpenAI's API.
@@ -783,7 +792,7 @@ async def completions_v1(request: CompletionRequest,
     return response
 
 
-@app.post('/v1/embeddings', tags=['unsupported'])
+@router.post('/v1/embeddings', tags=['unsupported'])
 async def create_embeddings(request: EmbeddingsRequest,
                             raw_request: Request = None):
     """Creates embeddings for the text."""
@@ -791,7 +800,7 @@ async def create_embeddings(request: EmbeddingsRequest,
                                  'Unsupported by turbomind.')
 
 
-@app.post('/v1/encode', dependencies=[Depends(check_api_key)])
+@router.post('/v1/encode', dependencies=[Depends(check_api_key)])
 async def encode(request: EncodeRequest, raw_request: Request = None):
     """Encode prompts.
 
@@ -822,7 +831,7 @@ async def encode(request: EncodeRequest, raw_request: Request = None):
         return EncodeResponse(input_ids=encoded, length=length)
 
 
-@app.post('/v1/chat/interactive', dependencies=[Depends(check_api_key)])
+@router.post('/v1/chat/interactive', dependencies=[Depends(check_api_key)])
 async def chat_interactive_v1(request: GenerateRequest,
                               raw_request: Request = None):
     """Generate completion for the request.
@@ -858,6 +867,12 @@ async def chat_interactive_v1(request: GenerateRequest,
         in the decoding. Default to be True.
     - adapter_name (str): For slora inference. Choose which lora to do the
         inference.
+    - min_new_tokens (int): To generate at least numbers of tokens.
+    - min_p (float): Minimum token probability, which will be scaled by the
+        probability of the most likely token. It must be a value between
+        0 and 1. Typical values are in the 0.01-0.2 range, comparably
+        selective as setting `top_p` in the 0.99-0.8 range (use the
+        opposite of normal `top_p` values)
     """
     if request.cancel:
         if request.session_id != -1:
@@ -899,6 +914,8 @@ async def chat_interactive_v1(request: GenerateRequest,
         ignore_eos=request.ignore_eos,
         stop_words=request.stop,
         skip_special_tokens=request.skip_special_tokens,
+        min_new_tokens=request.min_new_tokens,
+        min_p=request.min_p,
         random_seed=random_seed)
     if request.image_url:
         from lmdeploy.vl import load_image
@@ -961,7 +978,7 @@ async def chat_interactive_v1(request: GenerateRequest,
         return JSONResponse(ret)
 
 
-@app.on_event('startup')
+@router.on_event('startup')
 async def startup_event():
     if VariableInterface.proxy_url is None:
         return
@@ -1005,6 +1022,7 @@ def serve(model_path: str,
           ssl: bool = False,
           proxy_url: Optional[str] = None,
           max_log_len: int = None,
+          disable_fastapi_docs: bool = False,
           **kwargs):
     """An example to perform model inference through the command line
     interface.
@@ -1053,6 +1071,17 @@ def serve(model_path: str,
     if os.getenv('TM_LOG_LEVEL') is None:
         os.environ['TM_LOG_LEVEL'] = log_level
     logger.setLevel(log_level)
+
+    if disable_fastapi_docs:
+        app = FastAPI(
+            docs_url=None,
+            redoc_url=None,
+            openapi_url=None,
+        )
+    else:
+        app = FastAPI(docs_url='/')
+
+    app.include_router(router)
 
     mount_my_metrics(app)
 
