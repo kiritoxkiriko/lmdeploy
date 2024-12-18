@@ -1,5 +1,4 @@
-ARG VERSION=v0.6.2.post1
-
+ARG VERSION=v0.6.4
 FROM openmmlab/lmdeploy:${VERSION}-cu12
 
 #ENV PIP_INDEX_URL=https://mirrors.ustc.edu.cn/pypi/web/simple
