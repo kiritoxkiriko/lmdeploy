@@ -2,6 +2,8 @@
 
 我们基于 LMDeploy 的 PytorchEngine，增加了华为昇腾设备的支持。所以，在华为昇腾上使用 LDMeploy 的方法与在英伟达 GPU 上使用 PytorchEngine 后端的方法几乎相同。在阅读本教程之前，请先阅读原版的[快速开始](../get_started.md)。
 
+支持的模型列表在[这里](../../supported_models/supported_models.md#PyTorchEngine-华为昇腾平台).
+
 ## 安装
 
 我们强烈建议用户构建一个 Docker 镜像以简化环境设置。
@@ -37,6 +39,8 @@ Docker 版本应不低于 18.03。并且需按照[官方指南](https://www.hias
 DOCKER_BUILDKIT=1 docker build -t lmdeploy-aarch64-ascend:latest \
     -f docker/Dockerfile_aarch64_ascend .
 ```
+
+上述`Dockerfile_aarch64_ascend`适用于鲲鹏CPU. 如果是Intel CPU的机器，请尝试[这个dockerfile](https://github.com/InternLM/lmdeploy/issues/2745#issuecomment-2473285703) (未经过测试)
 
 如果以下命令执行没有任何错误，这表明环境设置成功。
 
@@ -129,3 +133,9 @@ lmdeploy lite auto_awq $HF_MODEL --work-dir $WORK_DIR --device npu
 ```
 
 支持的模型列表请参考[支持的模型](../../supported_models/supported_models.md)。
+
+### int8 KV-cache 量化
+
+昇腾后端现在支持了在eager模式下的离线int8 KV-cache量化。
+
+详细使用方式请请参考这篇[文章](https://github.com/DeepLink-org/dlinfer/blob/main/docs/quant/ascend_kv_quant.md)。
