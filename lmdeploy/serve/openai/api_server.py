@@ -44,7 +44,7 @@ def body_logger(request, raw_request: Request, start_time: float, resp=None):
     if resp is not None and hasattr(resp, 'model_dump_json'):
         resp = resp.model_dump_json()
     process_time = time.time() - start_time
-    request_id = raw_request.headers.get('X-NADP-RequestID')
+    request_id = raw_request.headers.get('X-NADP-RequestID') or raw_request.headers.get('X-RequestID')
     logger.info(
         f'receive request: id: {request_id}, body: {request_body}, resp: {resp}, time: {process_time}')
 
