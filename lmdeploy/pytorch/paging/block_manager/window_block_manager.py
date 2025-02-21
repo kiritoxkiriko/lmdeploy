@@ -1,9 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-from typing import Union
-
 import numpy as np
 
-from ...adapter.adapter import ADAPTER_MANAGER, SchedulerAdapter
 from ...block import LogicalTokenBlocks
 from ...messages import SchedulerSequence
 from .default_block_manager import DefaultBlockManager
@@ -52,8 +49,9 @@ class WindowBlockManager(DefaultBlockManager):
         self.window_size = window_size
 
     @classmethod
-    def num_required_blocks(cls, obj: Union[SchedulerSequence,
-                                            SchedulerAdapter]):
+    def num_required_blocks(cls,
+                            obj: SchedulerSequence,
+                            prealloc_size: int = 0):
         """get num required blocks."""
 
         def __num_req_seq(seq: SchedulerSequence):
@@ -63,21 +61,11 @@ class WindowBlockManager(DefaultBlockManager):
             lb_remain_tokens = 0
             if len(seq.logical_blocks) > 0:
                 lb_remain_tokens = block_size - lb_tokens
-            num_input_tokens = len(seq.token_ids)
+            num_input_tokens = seq.num_token_ids + prealloc_size
             num_req_tokens = max(0, num_input_tokens - lb_remain_tokens)
             return _div_up(num_req_tokens, block_size)
 
-        def __num_req_adapter(adapter: SchedulerAdapter):
-            """get num required adapter blocks."""
-            if adapter.is_actived():
-                return 0
-            else:
-                return adapter.rank * len(adapter.target_modules)
-
-        if isinstance(obj, SchedulerSequence):
-            return __num_req_seq(obj)
-        else:
-            return __num_req_adapter(obj)
+        return __num_req_seq(obj)
 
     @classmethod
     def last_block_size(cls, seq: SchedulerSequence) -> int:
@@ -87,17 +75,14 @@ class WindowBlockManager(DefaultBlockManager):
             return 0
         return _last_block_size(seq.history_len, seq.block_size)
 
-    def can_allocate(self, msg: SchedulerSequence):
+    def can_allocate(self, msg: SchedulerSequence, prealloc_size: int = 0):
         """Return if physical block can be allocated for given message."""
         num_drop_blocks = _num_blocks_to_drop(msg, self.window_size)
-        num_required_blocks = self.num_required_blocks(msg)
+        num_required_blocks = self.num_required_blocks(msg, prealloc_size)
         num_free_phy = self.get_num_free_gpu_blocks()
-        if msg.adapter_name is not None:
-            adapter = ADAPTER_MANAGER.get_adapter(msg.adapter_name)
-            num_required_blocks += self.num_required_blocks(adapter)
         return num_required_blocks <= num_free_phy + num_drop_blocks
 
-    def allocate_msg(self, msg: SchedulerSequence):
+    def allocate_msg(self, msg: SchedulerSequence, prealloc_size: int = 0):
         """Allocate physical blocks for given message according to logical
         blocks."""
         logical_blocks = msg.logical_blocks
@@ -133,7 +118,8 @@ class WindowBlockManager(DefaultBlockManager):
             return num_required_blocks, droped_blocks
 
         num_drop_blocks = _num_blocks_to_drop(msg, self.window_size)
-        num_required_blocks = self.num_required_blocks(msg)
+        num_required_blocks = self.num_required_blocks(msg, prealloc_size)
+        msg.num_ignored_history += num_drop_blocks * msg.block_size
 
         droped_blocks = __get_droped_blocks(num_drop_blocks)
 
@@ -148,23 +134,3 @@ class WindowBlockManager(DefaultBlockManager):
         # drop unused blocks
         if droped_blocks is not None:
             self.allocator.free(droped_blocks)
-
-    def allocate_adapter(self, adapter: SchedulerAdapter):
-        """Allocate cpu blocks for given adapter."""
-        num_required_blocks = self.num_required_blocks(adapter)
-        if num_required_blocks > 0:
-            blocks = self.allocator.allocate(num_required_blocks, 'cpu')
-            adapter.logical_blocks.append(blocks)
-
-    def free(self, msg: SchedulerSequence):
-        """Free all physical blocks allocated for the session."""
-        self.allocator.free(msg.logical_blocks.get_real_blocks())
-        msg.logical_blocks.reset()
-
-    def can_append_slot(self, msg: SchedulerSequence):
-        """Return true if the message can append new slot."""
-        return self.can_allocate(msg)
-
-    def append_slot(self, msg: SchedulerSequence):
-        """Append new slot to message."""
-        return self.allocate(msg)

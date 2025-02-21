@@ -2,18 +2,21 @@
 
 import os
 import random
-from typing import List
+from typing import List, Optional
 
-from lmdeploy.messages import EngineGenerationConfig, PytorchEngineConfig
-from lmdeploy.model import MODELS, best_match_model
+from lmdeploy.archs import get_model_arch
+from lmdeploy.messages import GenerationConfig, PytorchEngineConfig
+from lmdeploy.model import ChatTemplateConfig
+from lmdeploy.serve.async_engine import get_names_from_model
 from lmdeploy.tokenizer import DetokenizeState, Tokenizer
+from lmdeploy.utils import _get_and_verify_max_len
 
 os.environ['TM_LOG_LEVEL'] = 'ERROR'
 
 
-def input_prompt(model_name):
+def input_prompt(chat_template_name):
     """Input a prompt in the consolo interface."""
-    if model_name == 'codellama':
+    if chat_template_name == 'codellama':
         print('\nenter !! to end the input >>>\n', end='')
         sentinel = '!!'
     else:
@@ -49,16 +52,17 @@ def _stop_words(stop_words: List[str], tokenizer: Tokenizer):
 
 def run_chat(model_path: str,
              engine_config: PytorchEngineConfig,
-             gen_config: EngineGenerationConfig = None,
+             gen_config: GenerationConfig = None,
              session_id: int = 1,
-             trust_remote_code: bool = True):
+             trust_remote_code: bool = True,
+             chat_template_config: Optional[ChatTemplateConfig] = None):
     """An example to perform model inference through the command line
     interface.
 
     Args:
         model_path (str): the huggingface model path.
         engine_config (PytorchEngineConfig): Config of engine.
-        gen_config (EngineGenerationConfig): Config of generation.
+        gen_config (GenerationConfig): Config of generation.
         session_id (int): the identical id of a session.
         trust_remote_code (bool): trust remote code.
     """
@@ -73,21 +77,24 @@ def run_chat(model_path: str,
         adapter_name = next(iter(engine_config.adapters.keys()))
 
     if gen_config is None:
-        gen_config = EngineGenerationConfig()
+        gen_config = GenerationConfig()
 
     nth_round = 1
     step = 0
     seed = random.getrandbits(64)
-    model_name = engine_config.model_name
-    if model_name is None:
-        model_name = best_match_model(model_path)
-        assert model_name is not None, 'Can not find match model template'
-        print(f'match template: <{model_name}>')
-    model = MODELS.get(model_name)()
+
+    _, chat_template_name = get_names_from_model(model_path)
+    if chat_template_config is None:
+        chat_template_config = ChatTemplateConfig(chat_template_name)
+    model = chat_template_config.chat_template
+
     stop_words = _stop_words(model.stop_words, tokenizer)
 
+    _, model_config = get_model_arch(model_path)
+    session_len = _get_and_verify_max_len(model_config, None)
+
     while True:
-        prompt = input_prompt(model_name)
+        prompt = input_prompt(chat_template_name)
         if prompt == 'exit':
             exit(0)
         elif prompt == 'end':
@@ -98,23 +105,20 @@ def run_chat(model_path: str,
         else:
             prompt = model.get_prompt(prompt, nth_round == 1)
             input_ids = tokenizer.encode(prompt, nth_round == 1)
-            session_len = model.session_len
-            if session_len is None:
-                session_len = tm_model.session_len
             if step >= session_len:
                 print('WARNING: exceed session max length.'
                       ' Please end the session.')
                 continue
 
-            print(f'{prompt} ', end='', flush=True)
-            state = DetokenizeState()
+            print(f'{prompt}', end='', flush=True)
+            state = DetokenizeState(len(input_ids))
             gen_config.random_seed = seed
-            gen_config.stop_words = stop_words
+            gen_config.stop_token_ids = stop_words
             for outputs in generator.stream_infer(session_id=session_id,
                                                   input_ids=input_ids,
                                                   gen_config=gen_config,
                                                   adapter_name=adapter_name):
-                status, res, tokens = outputs
+                res, tokens = input_ids + outputs.token_ids, outputs.num_token
                 # decode res
                 response, state = tokenizer.detokenize_incrementally(
                     res, state)
@@ -129,49 +133,50 @@ def run_chat(model_path: str,
 
 
 def main(model_path: str,
-         model_name: str = None,
          session_id: int = 1,
          top_k: float = 40,
          top_p: float = 0.8,
          temperature: float = 0.8,
          repetition_penalty: float = 1.0,
          tp: int = 1,
-         stream_output: bool = True,
          adapter: str = None,
-         trust_remote_code: bool = True):
+         trust_remote_code: bool = True,
+         chat_template: str = None):
     """An example to perform model inference through the command line
     interface.
 
     Args:
         model_path (str): the huggingface model path
-        model_name (str): name of the model.
         session_id (int): the identical id of a session
         top_k (int): sampling top k.
         top_p (int): sampling top p.
         temperature (float): sampling temperature.
         repetition_penalty (float): parameter to penalize repetition
         tp (int): GPU number used in tensor parallelism
-        stream_output (bool): indicator for streaming output or not
         adapter (str): path to lora adapter.
         trust_remote_code (bool): Trust remote code.
+        chat_template (str): A JSON file or string that specifies the
+            chat template configuration.
     """
     adapters = None
     if adapter is not None:
         adapters = dict(default=adapter)
-    engine_config = PytorchEngineConfig(model_name=model_name,
-                                        tp=tp,
-                                        adapters=adapters)
-    gen_config = EngineGenerationConfig(max_new_tokens=512,
-                                        top_k=top_k,
-                                        top_p=top_p,
-                                        temperature=temperature,
-                                        repetition_penalty=repetition_penalty,
-                                        ignore_eos=False)
+    engine_config = PytorchEngineConfig(tp=tp, adapters=adapters)
+    gen_config = GenerationConfig(max_new_tokens=512,
+                                  top_k=top_k,
+                                  top_p=top_p,
+                                  temperature=temperature,
+                                  repetition_penalty=repetition_penalty,
+                                  ignore_eos=False)
+    chat_template_config = None
+    if chat_template is not None and os.path.exists(chat_template):
+        chat_template_config = ChatTemplateConfig.from_json(chat_template)
     return run_chat(model_path,
                     engine_config,
                     gen_config,
                     session_id=session_id,
-                    trust_remote_code=trust_remote_code)
+                    trust_remote_code=trust_remote_code,
+                    chat_template_config=chat_template_config)
 
 
 if __name__ == '__main__':

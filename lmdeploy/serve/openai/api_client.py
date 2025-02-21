@@ -7,14 +7,21 @@ import requests
 from lmdeploy.utils import get_logger
 
 
-def get_model_list(api_url: str):
+def get_model_list(api_url: str, headers: dict = None):
     """Get model list from api server."""
-    response = requests.get(api_url)
-    if hasattr(response, 'text'):
-        model_list = json.loads(response.text)
+    response = requests.get(api_url, headers=headers)
+    logger = get_logger('lmdeploy')
+    if not response.ok:
+        logger.error(f'Failed to get the model list: {api_url}'
+                     'returns {response.status_code}')
+        return None
+    elif not hasattr(response, 'text'):
+        logger.warning('Failed to get the model list.')
+        return None
+    else:
+        model_list = response.json()
         model_list = model_list.pop('data', [])
         return [item['id'] for item in model_list]
-    return None
 
 
 def json_loads(content):
@@ -59,13 +66,9 @@ class APIClient:
         """Show available models."""
         if self._available_models is not None:
             return self._available_models
-        response = requests.get(self.models_v1_url)
-        if hasattr(response, 'text'):
-            model_list = json_loads(response.text)
-            model_list = model_list.pop('data', [])
-            self._available_models = [item['id'] for item in model_list]
-            return self._available_models
-        return None
+        self._available_models = get_model_list(self.models_v1_url,
+                                                headers=self.headers)
+        return self._available_models
 
     def encode(self,
                input: Union[str, List[str]],
@@ -96,6 +99,8 @@ class APIClient:
                             messages: Union[str, List[Dict[str, str]]],
                             temperature: Optional[float] = 0.7,
                             top_p: Optional[float] = 1.0,
+                            logprobs: Optional[bool] = False,
+                            top_logprobs: Optional[int] = 0,
                             n: Optional[int] = 1,
                             max_tokens: Optional[int] = None,
                             stop: Optional[Union[str, List[str]]] = None,
@@ -162,6 +167,7 @@ class APIClient:
 
     def chat_interactive_v1(self,
                             prompt: Union[str, List[Dict[str, str]]],
+                            image_url: Optional[Union[str, List[str]]] = None,
                             session_id: int = -1,
                             interactive_mode: bool = False,
                             stream: bool = False,
@@ -173,6 +179,7 @@ class APIClient:
                             repetition_penalty: float = 1.0,
                             ignore_eos: bool = False,
                             skip_special_tokens: Optional[bool] = True,
+                            adapter_name: Optional[str] = None,
                             **kwargs):
         """Interactive completions.
 
@@ -183,6 +190,8 @@ class APIClient:
 
         Args:
             prompt: the prompt to use for the generation.
+            image_url (str | List[str] | None): the image url or base64 encoded
+                string for VL models.
             session_id: determine which instance will be called.
                 If not specified with a value other than -1, using random value
                 directly.
@@ -205,6 +214,8 @@ class APIClient:
             ignore_eos (bool): indicator for ignoring eos
             skip_special_tokens (bool): Whether or not to remove special tokens
                 in the decoding. Default to be True.
+            adapter_name (str): For slora inference. Choose which lora to do
+                the inference.
 
         Yields:
             json objects consist of text, tokens, input_tokens,
@@ -305,6 +316,7 @@ class APIClient:
     def chat(self,
              prompt: str,
              session_id: int,
+             image_url: Optional[Union[str, List[str]]] = None,
              request_output_len: int = 512,
              stream: bool = False,
              top_p: float = 0.8,
@@ -319,6 +331,8 @@ class APIClient:
             session_id: determine which instance will be called.
                 If not specified with a value other than -1, using random value
                 directly.
+            image_url (str | List[str] | None): the image url or base64 encoded
+                string for VL models.
             stream: whether to stream the results or not.
             stop: whether to stop the session response or not.
             request_output_len (int): output token nums
@@ -339,6 +353,7 @@ class APIClient:
         for outputs in self.chat_interactive_v1(
                 prompt,
                 session_id=session_id,
+                image_url=image_url,
                 request_output_len=request_output_len,
                 interactive_mode=True,
                 stream=stream,
@@ -415,10 +430,14 @@ def get_streaming_response(
             yield output, tokens, finish_reason
 
 
-def main(api_server_url: str,
+def main(api_server_url: str = 'http://0.0.0.0:23333',
          session_id: int = 0,
          api_key: Optional[str] = None):
     """Main function to chat in terminal."""
+    if not api_server_url.startswith('http://'):
+        print(f'[WARNING] api_server_url of the api_server should '
+              f'start with "http://", but got "{api_server_url}"')
+        api_server_url = 'http://' + api_server_url.strip()
     api_client = APIClient(api_server_url, api_key=api_key)
     while True:
         prompt = input_prompt()

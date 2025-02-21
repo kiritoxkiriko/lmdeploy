@@ -1,5 +1,4 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-import asyncio
 import time
 from dataclasses import dataclass, field
 from itertools import count
@@ -10,7 +9,7 @@ from packaging.version import Version, parse
 from PIL import Image
 
 from lmdeploy.messages import (GenerationConfig, PytorchEngineConfig,
-                               TurbomindEngineConfig)
+                               TurbomindEngineConfig, VisionConfig)
 from lmdeploy.model import ChatTemplateConfig
 from lmdeploy.pytorch.engine.request import _run_until_complete
 from lmdeploy.serve.gradio.constants import CSS, THEME, disable_btn, enable_btn
@@ -59,14 +58,6 @@ class Session:
         return self._step
 
 
-def preprocess(engine, prompt, sequence_start: bool):
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    inputs = loop.run_until_complete(
-        engine._get_prompt_input(prompt, True, sequence_start=sequence_start))
-    return inputs
-
-
 def run_local(model_path: str,
               model_name: Optional[str] = None,
               backend: Literal['turbomind', 'pytorch'] = 'turbomind',
@@ -79,12 +70,16 @@ def run_local(model_path: str,
               **kwargs):
 
     from lmdeploy.serve.vl_async_engine import VLAsyncEngine
+    if isinstance(backend_config, PytorchEngineConfig):
+        backend_config.thread_safe = True
+    vision_config = VisionConfig(thread_safe=True)
     engine = VLAsyncEngine(model_path=model_path,
                            model_name=model_name,
                            backend=backend,
                            backend_config=backend_config,
                            chat_template_config=chat_template_config,
                            tp=tp,
+                           vision_config=vision_config,
                            **kwargs)
 
     def add_image(chatbot, session, file):
@@ -126,9 +121,7 @@ def run_local(model_path: str,
         prompt = engine.vl_prompt_template.prompt_to_messages(prompt)
         t0 = time.perf_counter()
         inputs = _run_until_complete(
-            engine._get_prompt_input(prompt,
-                                     True,
-                                     sequence_start=sequence_start))
+            engine._get_prompt_input(prompt, True, sequence_start, ''))
         t1 = time.perf_counter()
         logger.info('preprocess cost %.3fs' % (t1 - t0))
 
@@ -142,9 +135,10 @@ def run_local(model_path: str,
             gen_config = GenerationConfig(max_new_tokens=max_new_tokens,
                                           top_p=top_p,
                                           top_k=top_k,
-                                          temperature=temperature)
+                                          temperature=temperature,
+                                          stop_token_ids=engine.stop_words)
             step = session.step
-            state = DetokenizeState()
+            state = DetokenizeState(len(input_ids))
             for outputs in generator.stream_infer(
                     session_id=session._session_id,
                     **inputs,
@@ -152,7 +146,7 @@ def run_local(model_path: str,
                     step=step,
                     gen_config=gen_config,
                     stream_output=True):
-                _, res, tokens = outputs
+                res, tokens = input_ids + outputs.token_ids, outputs.num_token
                 response, state = engine.tokenizer.detokenize_incrementally(
                     res,
                     state,
@@ -184,7 +178,10 @@ def run_local(model_path: str,
 
     def reset(session):
         """Reset a new session."""
-        stop(session)
+        if session is None:
+            session = Session()
+        else:
+            stop(session)
         session._step = 0
         session._message = []
         return [], session, enable_btn

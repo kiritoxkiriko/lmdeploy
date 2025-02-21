@@ -1,51 +1,35 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import asyncio
+import atexit
 import os
-from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, Dict, List, Union
+import threading
+from datetime import timedelta
+from typing import Any, Callable, Dict, List
 
 import torch
 import torch.distributed as dist
 from torch import multiprocessing as mp
-from torch.distributed._tensor import DeviceMesh, Replicate, distribute_tensor
-from transformers import AutoModelForCausalLM
 
-from lmdeploy.pytorch.accel import LoadNoInit
 from lmdeploy.utils import get_logger
 
-from ..adapter.adapter import (AdapterWeightMap, get_indexed_lora_linears,
-                               get_max_lora_weight_size, update_lora_linears)
-from ..config import CacheConfig, ModelConfig
-from ..models import patch
+from ..backends import get_backend
+from ..config import BackendConfig, CacheConfig, ModelConfig
+from ..devices import DeviceContext, get_device_manager
+from ..distributed import DistContext, get_dist_manager, get_world_rank
+from ..model_inputs import ModelInputs
+from ..models.patch import (add_adapters, build_patched_model,
+                            update_custom_module_map)
 from ..utils import get_gpu_memory
+from ..weight_loader.model_weight_loader import load_model_weights
 from .cache_engine import CacheEngine
 
 logger = get_logger('lmdeploy')
-
-_PATCH_ARG_NAMES = ['context', 'use_origin']
-
-
-def _infer_block_size(model: torch.nn.Module,
-                      model_config: ModelConfig,
-                      cache_config: CacheConfig,
-                      world_size: int = 1):
-    """infer block size."""
-    max_weight_dim = get_max_lora_weight_size(model)
-    if max_weight_dim == 0:
-        return cache_config.block_size
-
-    per_token_size = model_config.get_head_size(
-    ) * model_config.num_key_value_heads // world_size
-    block_size = 1
-    while block_size * per_token_size < max_weight_dim:
-        block_size *= 2
-    return block_size * world_size
 
 
 def _update_cache_config(model_config: ModelConfig,
                          cache_config: CacheConfig,
                          gpu_id: int = 0,
-                         host_mem_size: int = 4 * (1 << 30),
+                         host_mem_size: int = 1 * (1 << 30),
                          world_size: int = 1):
     """Update the gpu mem and cpu mem according to model info.
 
@@ -55,264 +39,73 @@ def _update_cache_config(model_config: ModelConfig,
         gpu_id (int): The GPU id to use.
     """
 
-    def __get_free_gpu_mem_size():
+    def __get_runtime_size(num_free_gpu_mem: int, cache_block_size: int,
+                           vocal_size: int):
+        """find best prefill num."""
+        cache_max_entry_count = cache_config.cache_max_entry_count
+        max_prefill_token_num = cache_config.max_prefill_token_num
+        runtime_cache_size = 0
+        while max_prefill_token_num > 0:
+            # lm_head output(2) + to float(4) + estimated misc(1) = 7
+            runtime_cache_size = int(max_prefill_token_num * vocal_size * 7)
+            num_available = (num_free_gpu_mem -
+                             runtime_cache_size) * cache_max_entry_count
+            if int(num_available) // cache_block_size >= 16:
+                break
+            max_prefill_token_num = max_prefill_token_num // 2
+        return runtime_cache_size, max_prefill_token_num
+
+    def __get_free_gpu_mem_size(cache_block_size: int):
         """get free gpu memory size."""
         torch.cuda.empty_cache()
         gpu_mem_physical_free, _ = get_gpu_memory(gpu_id)
         logger.debug(f'device<{gpu_id}> free gpu memory:'
                      f' {gpu_mem_physical_free>>20} mb')
         vocal_size = model_config.vocab_size
-        max_prefill_token_num = cache_config.max_prefill_token_num
-        # lm_head output(2) + to float(4) + estimated misc(1) = 7
-        intermediate_cache_size = int(max_prefill_token_num * vocal_size * 7)
+
+        runtime_cache_size, max_prefill_token_num = __get_runtime_size(
+            gpu_mem_physical_free, cache_block_size, vocal_size)
+        if cache_config.max_prefill_token_num != max_prefill_token_num:
+            if max_prefill_token_num <= 0:
+                raise RuntimeError('No enough gpu memory for runtime.')
+            cache_config.max_prefill_token_num = max_prefill_token_num
+            logger.warning(f'device<{gpu_id}> No enough memory. '
+                           'update max_prefill_token_num='
+                           f'{max_prefill_token_num}')
+        gpu_mem_physical_free -= runtime_cache_size
         logger.debug('estimated max runtime memory:'
-                     f' {intermediate_cache_size>>20} mb')
-        gpu_mem_physical_free -= intermediate_cache_size
+                     f' {runtime_cache_size>>20} mb')
         return gpu_mem_physical_free * cache_config.cache_max_entry_count
 
-    gpu_mem = __get_free_gpu_mem_size()
-    cpu_mem = host_mem_size
+    def __adjust_block_size():
+        """adjust block_size."""
+        # TODO: support kernel with both large head dim and large block size.
+        if model_config.k_head_dim >= 512 and cache_config.block_size > 32:
+            cache_config.block_size = 32
+            _, rank = get_world_rank()
+            if rank == 0:
+                logger.warning(
+                    f'Update `block_size={cache_config.block_size}`'
+                    f' for large `head_dim={model_config.k_head_dim}`.')
+
+    __adjust_block_size()
+
     cache_block_size = CacheEngine.get_cache_block_size(
-        cache_config.block_size, model_config, world_size)
+        cache_config.block_size, model_config, world_size,
+        cache_config.quant_policy)
+    gpu_mem = __get_free_gpu_mem_size(cache_block_size)
+    cpu_mem = host_mem_size
     if cache_config.num_cpu_blocks == 0:
         cache_config.num_cpu_blocks = int(cpu_mem / cache_block_size)
+        if cache_config.num_cpu_blocks <= 0:
+            raise RuntimeError('No enough host memory for kv cache.')
     if cache_config.num_gpu_blocks == 0:
         cache_config.num_gpu_blocks = int(gpu_mem / cache_block_size)
+        if cache_config.num_gpu_blocks <= 0:
+            raise RuntimeError('No enough gpu memory for kv cache.')
     cache_config.window_size = model_config.sliding_window
 
     logger.debug('block num: {}'.format(cache_config.num_gpu_blocks))
-
-
-@dataclass
-class ModelInputs:
-    """Input of the model."""
-    input_ids: torch.LongTensor
-    seq_length: torch.LongTensor
-    attention_mask: torch.Tensor
-    block_offsets: torch.LongTensor
-    position_ids: torch.LongTensor
-    q_start_loc: torch.LongTensor
-    history_lengths: List[int]
-    is_decoding: bool
-    local_adapter_ids: torch.LongTensor = None
-    global_adapter_ids: torch.LongTensor = None
-    adapter_offsets: torch.LongTensor = None
-    max_rank: int = 0
-    meta: Any = None
-
-    def slice(self, start: int, end: int):
-        """select by indices."""
-        sli = slice(start, end)
-
-        start_loc = self.q_start_loc[sli]
-        seq_length = self.seq_length[sli]
-        end_loc = start_loc[-1] + seq_length[-1]
-        input_ids = self.input_ids[:, start_loc[0]:end_loc]
-        start_loc = start_loc - start_loc[0]
-
-        history_lengths = self.history_lengths[sli]
-
-        local_adapter_ids = self.local_adapter_ids
-        if local_adapter_ids is not None:
-            local_adapter_ids = local_adapter_ids[sli]
-
-        return ModelInputs(input_ids=input_ids,
-                           seq_length=seq_length,
-                           attention_mask=self.attention_mask[sli],
-                           block_offsets=self.block_offsets[sli],
-                           position_ids=self.position_ids[sli],
-                           q_start_loc=start_loc,
-                           history_lengths=history_lengths,
-                           is_decoding=self.is_decoding,
-                           local_adapter_ids=local_adapter_ids,
-                           global_adapter_ids=self.global_adapter_ids,
-                           adapter_offsets=self.adapter_offsets,
-                           max_rank=self.max_rank,
-                           meta=self.meta)
-
-    def split(self, split_size: int, block_size: int):
-        """split inputs."""
-        assert len(
-            self.seq_length) == 1, ('Can not perform split on batched input.')
-        assert split_size % block_size == 0, (
-            'split_size should be multi of block_size.')
-
-        input_ids = self.input_ids
-        if input_ids.numel() < split_size:
-            return self
-
-        num_blocks = split_size // block_size
-        overlap = (self.history_lengths[0] % block_size != 0)
-        max_seq_len = self.seq_length[0].item()
-        ret = []
-        block_start = 0
-        history_len = self.history_lengths[0]
-        for i in range(0, max_seq_len, split_size):
-            start = i
-            end = min(max_seq_len, i + split_size)
-            block_end = block_start + num_blocks
-            if overlap:
-                block_end += 1
-
-            local_adapter_ids = self.local_adapter_ids
-            if local_adapter_ids is not None:
-                local_adapter_ids = local_adapter_ids[:, start:end]
-
-            inp = ModelInputs(
-                input_ids=self.input_ids[:, start:end],
-                seq_length=input_ids.new_tensor([end - start]),
-                attention_mask=self.attention_mask[:, start:end],
-                block_offsets=self.block_offsets[:, :block_end],
-                position_ids=self.position_ids[:, start:end],
-                q_start_loc=input_ids.new_zeros(1),
-                history_lengths=[history_len + start],
-                is_decoding=self.is_decoding,
-                local_adapter_ids=local_adapter_ids,
-                global_adapter_ids=self.global_adapter_ids,
-                adapter_offsets=self.adapter_offsets,
-                max_rank=self.max_rank,
-                meta=self.meta,
-            )
-            ret.append(inp)
-            block_start += num_blocks
-
-        return ret
-
-    def to_device(self, device: str):
-        """to device."""
-        input_dict = asdict(self)
-        out_dict = dict()
-        for k, v in input_dict.items():
-            if isinstance(v, torch.Tensor):
-                v = v.to(device)
-            out_dict[k] = v
-
-        return ModelInputs(**out_dict)
-
-
-@dataclass
-class StepContext:
-    """context of Model.
-
-    patched model might need extra information to perform inference. This
-    dataclass provide these infos and tools.
-    """
-    inputs: ModelInputs
-    block_offsets: torch.LongTensor
-    position_ids: torch.LongTensor
-    position_ids_1d: torch.LongTensor
-    q_start_loc: torch.LongTensor
-    history_lengths: torch.LongTensor
-    q_seq_length: torch.LongTensor
-    kv_seq_length: torch.LongTensor
-    max_q_seq_length: int
-    max_kv_seq_length: int
-    kv_caches: List
-    is_decoding: bool
-    world_size: int = 1
-    json_config: Dict = None
-    local_adapter_ids: torch.LongTensor = None
-    global_adapter_ids: torch.LongTensor = None
-    adapter_offsets: torch.LongTensor = None
-    max_rank: int = 0
-
-    _outputs: Dict = field(default_factory=dict)
-
-    @classmethod
-    def new(
-        cls,
-        inputs: ModelInputs,
-        world_size: int = 1,
-        device: str = 'cuda',
-        json_config: dict = None,
-        kv_caches: List = None,
-    ):
-        """build step context.
-
-        Args:
-            inputs (ModelInputs): packaged model inputs.
-            world_size (int): The distribution world size.
-            device (str): The device of the tensors.
-        """
-
-        position_ids = inputs.position_ids
-        max_q_seq_length = position_ids.size(-1)
-
-        # seq_len + history_length
-        kv_seq_length = position_ids[..., -1] + 1
-
-        # position ids 1d
-        q_seq_length = inputs.seq_length
-        position_ids_1d = cls.get_position_ids_1d(position_ids, q_seq_length,
-                                                  device)
-
-        max_kv_seq_length = max_q_seq_length + max(inputs.history_lengths)
-
-        ret = StepContext(inputs=inputs,
-                          block_offsets=inputs.block_offsets,
-                          position_ids=inputs.position_ids,
-                          position_ids_1d=position_ids_1d,
-                          q_start_loc=inputs.q_start_loc,
-                          history_lengths=inputs.history_lengths,
-                          q_seq_length=inputs.seq_length,
-                          kv_seq_length=kv_seq_length,
-                          max_q_seq_length=max_q_seq_length,
-                          max_kv_seq_length=max_kv_seq_length,
-                          kv_caches=kv_caches,
-                          is_decoding=inputs.is_decoding,
-                          world_size=world_size,
-                          json_config=json_config,
-                          local_adapter_ids=inputs.local_adapter_ids,
-                          global_adapter_ids=inputs.global_adapter_ids,
-                          adapter_offsets=inputs.adapter_offsets,
-                          max_rank=inputs.max_rank)
-        return ret
-
-    @classmethod
-    def tensorlize_block_offsets(cls, block_offsets, device):
-        """tensorlize block_offsets."""
-        import numpy as np
-        offset_len = [len(offset) for offset in block_offsets]
-        max_offsets_len = max(offset_len)
-        batch_size = len(offset_len)
-        pad_block_offsets = np.zeros((batch_size, max_offsets_len),
-                                     dtype=np.int64)
-
-        for pad_offset, offset, off_len in zip(pad_block_offsets,
-                                               block_offsets, offset_len):
-            pad_offset[:off_len] = offset
-
-        block_offsets = torch.from_numpy(pad_block_offsets).to(device)
-        return block_offsets
-
-    @classmethod
-    def get_position_ids_1d(cls,
-                            position_ids: torch.LongTensor,
-                            seq_length: torch.LongTensor,
-                            device: str = 'cuda'):
-        """get 1d position_ids."""
-        if position_ids.size(1) == 1:
-            position_ids_1d = position_ids.flatten()
-        else:
-            position_ids_1d = [
-                ids[:l] for ids, l in zip(position_ids.cpu(), seq_length.cpu())
-            ]
-            position_ids_1d = torch.cat(position_ids_1d).to(device)
-        return position_ids_1d
-
-    def get_block_offsets(self):
-        """return block offsets."""
-        return self.block_offsets
-
-    def set_output(self, key, value):
-        """set output."""
-        self._outputs[key] = value
-
-    def get_output(self, key):
-        """get output."""
-        if key in self._outputs:
-            return self._outputs[key]
-        return None
 
 
 def cache_swapping(cache_engine: CacheEngine, swap_in_map: dict,
@@ -332,81 +125,33 @@ def cache_swapping(cache_engine: CacheEngine, swap_in_map: dict,
             event.wait()
 
 
+@torch.inference_mode()
 def model_forward(
-    patched_model: torch.nn.Module,
+    model: torch.nn.Module,
     inputs: ModelInputs,
     cache_engine: CacheEngine,
-    json_config: dict = None,
     world_size: int = 1,
     stream: torch.cuda.Stream = None,
 ):
     """perform model forward."""
     stream = stream or torch.cuda.current_stream()
-    with torch.inference_mode(), torch.cuda.stream(stream):
+    with torch.cuda.stream(stream):
         # forward
         inputs = inputs.to_device('cuda')
-        context = StepContext.new(
+        ctx_mgr = model.ctx_mgr
+        context = ctx_mgr.build_context(
             inputs=inputs,
             world_size=world_size,
-            json_config=json_config,
             kv_caches=cache_engine.gpu_cache,
+            kv_quant_policy=cache_engine.cache_config.quant_policy,
         )
-        output = patched_model.patched_forward(
-            input_ids=inputs.input_ids,
-            position_ids=inputs.position_ids,
-            attention_mask=inputs.attention_mask,
-            past_key_values=cache_engine.gpu_cache,
-            return_dict=True,
-            output_attentions=False,
-            output_hidden_states=False,
-            use_origin=False,
-            context=context,
-        )
-    return dict(logits=output['logits'], custom_outputs=context._outputs)
-
-
-def _load_adapters(hf_model: torch.nn.Module,
-                   adapters: Dict[str, str],
-                   device_map: str = 'cpu'):
-    """load adapters."""
-    if not adapters:
-        return
-    for name, path in adapters.items():
-        logger.info(f'load adapter <{name}> from "{path}".')
-        hf_model.load_adapter(path, name, device_map=device_map)
-
-
-def _add_adapters(hf_model: torch.nn.Module, adapters: Dict[str, str]):
-    """add adapters."""
-    if not adapters:
-        return
-    from peft import PeftConfig, inject_adapter_in_model
-    for name, path in adapters.items():
-        config = PeftConfig.from_pretrained(path)
-        inject_adapter_in_model(config, model=hf_model, adapter_name=name)
-
-
-def _unparam_lora_weight(model: torch.nn.Module):
-    """unparam lora weight.
-
-    We don't want to move weight of lora to gpu.
-    """
-    from peft.tuners.lora import Linear as LoRALinear
-
-    def _tensorize_weight(linear):
-        """tensorize weight."""
-        w = linear.weight
-        del linear.weight
-        linear.weight = w.data
-
-    for _, mod in model.named_modules():
-        if isinstance(mod, LoRALinear):
-            lora_A = mod.lora_A
-            lora_B = mod.lora_B
-            for linear in lora_A.values():
-                _tensorize_weight(linear)
-            for linear in lora_B.values():
-                _tensorize_weight(linear)
+        with ctx_mgr.context(context):
+            input_dict = model.prepare_inputs_for_generation(
+                past_key_values=cache_engine.gpu_cache,
+                context=context,
+            )
+            output = model(**input_dict)
+    return dict(hidden_states=output)
 
 
 SwapMap = Dict[int, int]
@@ -419,9 +164,9 @@ class AutoModelAgent:
         self.model_config = model_config
         self.cache_config = cache_config
 
-    def paging_adapters(self, weight_maps: List[AdapterWeightMap]):
-        """paging adapter."""
-        raise NotImplementedError('Not implemented.')
+    def get_block_numel(self):
+        """get block nelement."""
+        raise NotImplementedError('Not implemented')
 
     async def async_forward(self, inputs: ModelInputs, swap_in_map: SwapMap,
                             swap_out_map: SwapMap):
@@ -445,19 +190,9 @@ class AutoModelAgent:
         """
         raise NotImplementedError('Not implemented.')
 
-    @classmethod
-    def from_pretrained(cls,
-                        pretrained_model_name_or_path: str,
-                        cache_config: CacheConfig,
-                        trust_remote_code: bool,
-                        adapters: Dict[str, str] = None,
-                        tp: int = 1):
-        """from pretrained."""
-        return build_model_agent(pretrained_model_name_or_path,
-                                 cache_config=cache_config,
-                                 trust_remote_code=trust_remote_code,
-                                 adapters=adapters,
-                                 tp=tp)
+    def get_logits(self, hidden_states: torch.Tensor):
+        """get logits of model output."""
+        raise NotImplementedError('Not implemented.')
 
 
 class BaseModelAgent(AutoModelAgent):
@@ -476,65 +211,56 @@ class BaseModelAgent(AutoModelAgent):
                  model_path: str,
                  model_config: ModelConfig,
                  cache_config: CacheConfig,
+                 backend_config: BackendConfig,
                  adapters: Dict[str, str] = None,
                  trust_remote_code: bool = True):
         super().__init__(model_config=model_config, cache_config=cache_config)
-        torch_dtype = model_config.dtype
+        device = 'cuda'
+        self.backend_config = backend_config
+        self._adapters = adapters
 
-        self.patched_model = self._build_model(
-            model_path,
-            torch_dtype=torch_dtype,
-            adapters=adapters,
-            trust_remote_code=trust_remote_code)
+        self.patched_model = self._build_model(model_path,
+                                               adapters,
+                                               device=device)
 
-        block_size = _infer_block_size(self.patched_model, model_config,
-                                       cache_config)
-        if block_size != cache_config.block_size:
-            cache_config.block_size = block_size
-            logger.warning(f'infered block size: {block_size}')
         _update_cache_config(model_config, cache_config)
 
+        backend = get_backend()
+        self.patched_model = backend.build_graph_runner(
+            self.patched_model,
+            model_config=model_config,
+            cache_config=cache_config,
+            backend_config=backend_config,
+            device=device)
+
         self.cache_engine = CacheEngine(cache_config, model_config)
+
         self.stream = torch.cuda.Stream()
 
     def _build_model(self,
                      model_path: str,
-                     torch_dtype: torch.dtype,
                      adapters: Dict[str, str] = None,
-                     trust_remote_code: bool = True):
+                     device: torch.device = 'cuda'):
         """build patched model."""
-        with LoadNoInit():
-            hf_model = AutoModelForCausalLM.from_pretrained(
-                model_path,
-                torch_dtype=torch_dtype,
-                trust_remote_code=trust_remote_code,
-                **self.model_config.init_kwargs)
-            hf_model.eval()
-            hf_model.config.use_cache = True
-
-        if adapters:
-            _load_adapters(hf_model, adapters)
-
-        patched_model = patch(hf_model, _PATCH_ARG_NAMES)
-
-        if adapters:
-            _unparam_lora_weight(patched_model)
-
-        patched_model = patched_model.cuda()
+        custom_module_map = self.model_config.custom_module_map
+        if custom_module_map is not None:
+            update_custom_module_map(custom_module_map)
+        logger.info('build model.')
+        patched_model = build_patched_model(self.model_config, device=device)
+        logger.info('loading weights.')
+        load_model_weights(patched_model, model_path, device=device)
+        logger.info('loading adapters.')
+        if adapters is not None:
+            add_adapters(patched_model,
+                         adapters,
+                         dtype=self.model_config.dtype,
+                         device=device)
         return patched_model
 
-    def paging_adapters(self, weight_maps: List[AdapterWeightMap]):
-        """paging adapter."""
-        logger.info('paging adapters.')
-        lora_linears = get_indexed_lora_linears(self.patched_model)
-        cpu_caches = self.cache_engine.cpu_cache
-        num_blocks = self.cache_engine.num_cpu_blocks
-        cpu_caches = [(kcache.view(num_blocks,
-                                   -1), vcache.view(num_blocks, -1))
-                      for kcache, vcache in cpu_caches]
-        for weight_map in weight_maps:
-            weight_map.cache_adapter(lora_linears, cpu_caches)
-        update_lora_linears(lora_linears, weight_maps, device='cuda')
+    def get_block_numel(self):
+        """get block nelement."""
+        k_cache = self.cache_engine.local_gpu_cache[0][0]
+        return k_cache[0].numel()
 
     def _forward_impl(self, inputs: ModelInputs, swap_in_map: SwapMap,
                       swap_out_map: SwapMap):
@@ -545,7 +271,6 @@ class BaseModelAgent(AutoModelAgent):
             self.patched_model,
             inputs,
             self.cache_engine,
-            self.model_config.json_config,
             world_size=1,
             stream=self.stream,
         )
@@ -582,116 +307,25 @@ class BaseModelAgent(AutoModelAgent):
                                                        self.stream.synchronize)
         return output
 
-
-@dataclass
-class TPResponse:
-    ret_code: int
-    error: Union[Exception, List[Exception]] = None
-    data: Any = None
-
-    def gather_error(self):
-        """gather error."""
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
-
-        # gather errors
-        error_count = torch.tensor(self.ret_code).cuda(rank)
-        dist.all_reduce(error_count)
-        if error_count.item() > 0:
-            all_errors = [None] * world_size
-            dist.all_gather_object(all_errors, self.error)
-            self.ret_code = 1
-            self.error = all_errors
-
-    def raise_error(self, default_error: Exception):
-        """raise error."""
-        if self.error is None:
-            raise default_error
-        elif isinstance(self.error, Exception):
-            raise self.error
-        else:
-            assert isinstance(self.error, List), ('expect error type list, '
-                                                  f'got {type(self.error)}')
-            rank = dist.get_rank()
-            err = self.error[rank]
-            if err is None:
-                raise default_error
-            else:
-                raise err
+    def get_logits(self, hidden_states: torch.Tensor):
+        """get logits of model output."""
+        return self.patched_model.get_logits(hidden_states)
 
 
-def _get_model_memory_usage(model: torch.nn.Module) -> int:
-    """get model memory usage."""
-    size = 0
-    for _, param in model.named_parameters():
-        size += param.element_size() * param.numel()
-    for _, buf in model.named_buffers():
-        size += buf.element_size() * param.numel()
-    return size
-
-
-def _create_device_map(model: torch.nn.Module,
-                       world_size: int,
-                       device_map: dict = None):
-    """Distribute params to each devices."""
-    if device_map is None:
-        device_map = dict()
-    device_id = 0
-    for name, _ in model.named_parameters():
-        device_map[name] = device_id
-        device_id = (device_id + 1) % world_size
-    for name, _ in model.named_buffers():
-        device_map[name] = device_id
-        device_id = (device_id + 1) % world_size
-    return device_map
-
-
+@torch.inference_mode()
 def _tp_build_model(
     rank: int,
     model_path: str,
     model_config: ModelConfig,
     cache_config: CacheConfig,
+    backend_config: BackendConfig,
     adapters: Dict[str, str],
-    out_que: mp.Queue,
     world_size: int,
-    trust_remote_code=True,
 ):
     """build tensor parallel model."""
-    from accelerate import init_empty_weights
 
-    error_code = 0
-    error_type = None
     patched_model = None
     cache_engine = None
-
-    def __get_device_map(model, device_map=None):
-        """get device map of model."""
-        import psutil
-        model_size = _get_model_memory_usage(model)
-        if psutil.virtual_memory().available < model_size:
-            logger.debug('Preload model on GPU.')
-            return device_map
-        else:
-            logger.debug('Preload model on CPU.')
-            return 'cpu'
-
-    def __load_params_and_buffers(param_mod, mod):
-        """load param and buffer."""
-        for name, param in param_mod.named_parameters(recurse=False):
-            mod.register_parameter(name, param)
-        for name, buffer in param_mod.named_buffers(recurse=False):
-            mod.register_buffer(name, buffer)
-
-    def __load_state_dict_assign(param_model, model):
-        """load state dict assign."""
-        try:
-            model.load_state_dict(param_model.state_dict(), assign=True)
-        except Exception:
-            __load_params_and_buffers(param_model, model)
-            mods = dict(model.named_modules())
-            for mod_name, param_mod in param_model.named_modules():
-                mod = mods[mod_name]
-                __load_params_and_buffers(param_mod, mod)
 
     def _broadcast_config(cache_config):
         """broadcast cache config, use minimum cache."""
@@ -717,168 +351,60 @@ def _tp_build_model(
         return config_list[0]
 
     try:
-        config = model_config.hf_config
-        torch_dtype = model_config.dtype
-        device_map = None
-        with init_empty_weights():
-            model = AutoModelForCausalLM.from_config(
-                config,
-                torch_dtype=torch_dtype,
-                trust_remote_code=trust_remote_code,
-                **model_config.init_kwargs)
-            if rank == 0:
-                device_map = _create_device_map(model, world_size)
-            _add_adapters(model, adapters)
-            if rank == 0:
-                # adapter would remove weight of linear.
-                device_map = _create_device_map(model, world_size, device_map)
-        model.eval()
-        model.config.use_cache = True
+        device_map = torch.device('cuda')
 
+        custom_module_map = model_config.custom_module_map
+        if custom_module_map is not None:
+            update_custom_module_map(custom_module_map)
         if rank == 0:
-            with LoadNoInit():
-                device_map = __get_device_map(model, device_map)
-                param_model = AutoModelForCausalLM.from_pretrained(
-                    model_path,
-                    torch_dtype=torch_dtype,
-                    device_map=device_map,
-                    trust_remote_code=trust_remote_code,
-                    **model_config.init_kwargs)
-                _load_adapters(param_model, adapters, device_map=device_map)
-                __load_state_dict_assign(param_model, model)
-                param_model = param_model.to('meta')
-                del param_model
+            logger.info('build model.')
+        patched_model = build_patched_model(model_config, device=device_map)
+        if rank == 0:
+            logger.info('loading weights.')
+        load_model_weights(patched_model, model_path, device=device_map)
 
-        patched_model = patch(
-            model,
-            extra_args=_PATCH_ARG_NAMES,
-            rank=rank,
-            world_size=world_size,
-        )
-
-        block_size = _infer_block_size(patched_model, model_config,
-                                       cache_config, world_size)
-        if block_size != cache_config.block_size:
-            cache_config.block_size = block_size
+        if adapters is not None:
             if rank == 0:
-                logger.warning(f'infered block size: {block_size}')
+                logger.info('loading adapters.')
+            add_adapters(patched_model,
+                         adapters,
+                         dtype=model_config.dtype,
+                         device=device_map)
+
         _update_cache_config(model_config,
                              cache_config,
                              gpu_id=rank,
                              world_size=world_size)
+
+        backend = get_backend()
+        patched_model = backend.build_graph_runner(
+            patched_model,
+            model_config=model_config,
+            cache_config=cache_config,
+            backend_config=backend_config,
+            device='cuda')
+
         cache_config = _broadcast_config(cache_config)
         cache_engine = CacheEngine(cache_config,
                                    model_config,
                                    rank=rank,
                                    world_size=world_size)
+
     except Exception as e:
-        logger.error(f'rank[{rank}] failed with error: {e}')
-        error_code = 1
-        error_type = e
+        raise e
 
-    # response
-    resp = TPResponse(error_code, error_type, cache_config)
-    resp.gather_error()
-    if rank == 0:
-        out_que.put(resp)
-    if resp.ret_code != 0:
-        resp.raise_error(RuntimeError('failed to init model.'))
-
-    return patched_model, cache_engine
+    return patched_model, cache_engine, cache_config
 
 
-def _tp_get_input(rank: int, in_que: mp.Queue, world_size: int):
+def _broadcast_inputs(rank: int, inputs: Any, stream: torch.cuda.Stream):
     """get input tensor parallel."""
-    device_mesh = DeviceMesh('cuda', list(range(world_size)))
-
     # broadcast meta info
-    if rank == 0:
-        inputs, swap_in_map, swap_out_map = in_que.get()
-        inputs = asdict(inputs)
-        input_tensors = dict(
-            (k, v) for k, v in inputs.items() if isinstance(v, torch.Tensor))
-        tensor_metas = dict(
-            (name, (t.shape, t.dtype)) for name, t in input_tensors.items())
-        other_metas = dict((k, v) for k, v in inputs.items()
-                           if not isinstance(v, torch.Tensor))
-        input_metas = (tensor_metas, other_metas)
-        objs = [input_metas, swap_in_map, swap_out_map]
-    else:
-        objs = [None, None, None]
-
-    dist.broadcast_object_list(objs)
-
     if rank != 0:
-        input_metas = objs[0]
-        tensor_metas, other_metas = input_metas
-        input_tensors = dict((name, torch.empty(meta[0], dtype=meta[1]))
-                             for name, meta in tensor_metas.items())
+        inputs = [None, None, None]
 
-    updated_inputs = dict()
-    for name, t in input_tensors.items():
-        updated_inputs[name] = distribute_tensor(t,
-                                                 device_mesh=device_mesh,
-                                                 placements=[Replicate()
-                                                             ]).to_local()
-    torch.cuda.synchronize()
-
-    inputs = updated_inputs
-    inputs.update(other_metas)
-    inputs = ModelInputs(**inputs)
-
-    swap_in_map = objs[1]
-    swap_out_map = objs[2]
-    return inputs, swap_in_map, swap_out_map
-
-
-def _tp_paging_adapters(
-    rank: int,
-    patched_model: torch.nn.Module,
-    cache_engine: CacheEngine,
-    in_que: mp.Queue,
-    out_que: mp.Queue,
-):
-    """tp paging adapters."""
-
-    def __get_weight_map():
-        """get weight map."""
-        if rank == 0:
-            weight_maps = in_que.get()
-            dist_obj = [weight_maps]
-        else:
-            dist_obj = [None]
-        dist.broadcast_object_list(dist_obj)
-        return dist_obj[0]
-
-    def __paging(weight_maps):
-        """paging."""
-        lora_linears = get_indexed_lora_linears(patched_model)
-        cpu_caches = cache_engine.cpu_cache
-        num_blocks = cache_engine.num_cpu_blocks
-        cpu_caches = [(kcache.view(num_blocks,
-                                   -1), vcache.view(num_blocks, -1))
-                      for kcache, vcache in cpu_caches]
-        for weight_map in weight_maps:
-            weight_map.cache_adapter(lora_linears, cpu_caches)
-        update_lora_linears(lora_linears, weight_maps, device='cuda')
-
-    weight_maps = __get_weight_map()
-
-    resp = TPResponse(0)
-    try:
-        if rank == 0:
-            logger.info('tp paging adapters.')
-        if len(weight_maps) > 0:
-            __paging(weight_maps)
-    except Exception as e:
-        resp.ret_code = 1
-        resp.error = e
-
-    resp.gather_error()
-    if rank == 0:
-        out_que.put(resp)
-    if resp.ret_code != 0:
-        resp.raise_error(RuntimeError('tp paging adapters failed.'))
+    with torch.cuda.stream(stream):
+        dist.broadcast_object_list(inputs)
+    return inputs
 
 
 def _tp_model_loop(
@@ -886,11 +412,10 @@ def _tp_model_loop(
     model_path: str,
     model_config: ModelConfig,
     cache_config: CacheConfig,
+    backend_config: BackendConfig,
     adapters: Dict[str, str],
-    in_que: mp.Queue,
-    out_que: mp.Queue,
     world_size: int,
-    trust_remote_code=True,
+    barrier: mp.Barrier,
 ):
     """Start model loops for tensor parallel model inference.
 
@@ -905,51 +430,39 @@ def _tp_model_loop(
         world_size (int): The distribution world size.
     """
     stream = torch.cuda.Stream()
-    patched_model, cache_engine = _tp_build_model(
-        rank,
-        model_path,
-        model_config,
-        cache_config,
-        adapters,
-        out_que=out_que,
-        world_size=world_size,
-        trust_remote_code=trust_remote_code)
-
-    if adapters:
-        _tp_paging_adapters(rank,
-                            patched_model,
-                            cache_engine=cache_engine,
-                            in_que=in_que,
-                            out_que=out_que)
+    patched_model, cache_engine, _ = _tp_build_model(rank,
+                                                     model_path,
+                                                     model_config,
+                                                     cache_config,
+                                                     backend_config,
+                                                     adapters=adapters,
+                                                     world_size=world_size)
 
     while True:
-        inputs, swap_in_map, swap_out_map = _tp_get_input(
-            rank, in_que, world_size)
+        barrier.wait()
+        inputs, swap_in_map, swap_out_map = _broadcast_inputs(
+            rank, None, stream)
 
         cache_swapping(cache_engine,
                        swap_in_map=swap_in_map,
                        swap_out_map=swap_out_map)
 
-        output = model_forward(
+        model_forward(
             patched_model,
             inputs,
             cache_engine,
-            model_config.json_config,
             world_size=world_size,
             stream=stream,
         )
-        stream.synchronize()
-        if rank == 0:
-            resp_output = output
-            out_que.put(TPResponse(0, None, resp_output))
 
 
-def _start_tp_process(rank: int,
+def _start_tp_process(proc_id: int,
                       world_size: int,
                       func: Callable,
+                      log_level: int,
+                      device_context: DeviceContext,
                       args: List = None,
-                      kwargs: Dict = None,
-                      port: int = 29500):
+                      kwargs: Dict = None):
     """Start the tensor parallel process.
 
     Args:
@@ -959,12 +472,19 @@ def _start_tp_process(rank: int,
         args (List): The arguments of the func.
         kwargs (Dict): The keyword arguments of the func.
     """
+    rank = proc_id + 1
+    logger.setLevel(log_level)
     try:
-        os.environ['MASTER_ADDR'] = '127.0.0.1'
-        os.environ['MASTER_PORT'] = str(port)
-        dist.init_process_group('nccl', rank=rank, world_size=world_size)
-
-        with torch.cuda.device(rank), torch.no_grad():
+        from lmdeploy.pytorch.check_env import check_env_deeplink
+        check_env_deeplink(device_context.device_type)
+        dist.init_process_group('nccl',
+                                rank=rank,
+                                world_size=world_size,
+                                timeout=timedelta(days=35600))
+        dist_ctx = DistContext(rank=rank, world_size=world_size)
+        torch.cuda.set_device(rank)
+        with get_dist_manager().context(dist_ctx), get_device_manager(
+        ).context(device_context), torch.inference_mode():
             args = args or tuple()
             kwargs = kwargs or dict()
             func(rank, *args, **kwargs)
@@ -972,48 +492,43 @@ def _start_tp_process(rank: int,
         from traceback import print_exc
         logger.error(f'Rank[{rank}] failed.')
         print_exc()
+        if dist.is_initialized():
+            dist.destroy_process_group()
         raise e
 
 
 def _check_context_alive(mp_context: mp.ProcessContext):
     """check context alive."""
-    procs = mp_context.processes
+    procs: List[mp.Process] = mp_context.processes
+    failed_procs = list(idx for idx, p in enumerate(procs) if not p.is_alive())
+    if len(failed_procs) == 0:
+        return
+
+    log_procs = []
     for idx, p in enumerate(procs):
-        if not p.is_alive():
-            raise RuntimeError(f'Rank[{idx}] failed.')
+        if p.is_alive():
+            p.terminate()
+        else:
+            exitcode = p.exitcode
+            if exitcode > 0:
+                # terminated exitcode < 0
+                log_procs.append((idx, exitcode))
+            p.close()
+    for idx, exitcode in log_procs:
+        logger.error(f'TP process {idx} failed with exitcode {exitcode}.')
+    # TODO: not safe exit.
+    os._exit(1)
 
 
-def _queue_get_response(que: mp.Queue,
-                        mp_context: mp.ProcessContext,
-                        interval: float = 1.0):
-    """get response."""
-    from multiprocessing.queues import Empty
+def _find_available_port() -> bool:
+    """find available port."""
+    import socket
+    port = 29500
     while True:
-        try:
-            return que.get(timeout=interval)
-        except Empty:
-            _check_context_alive(mp_context)
-
-
-async def _async_queue_get_response(que: mp.Queue,
-                                    mp_context: mp.ProcessContext,
-                                    interval: float = 1.0):
-    """get response."""
-    from multiprocessing.queues import Empty
-
-    def __try_que_get():
-        """try que get."""
-        try:
-            return que.get(timeout=interval)
-        except Empty:
-            return None
-
-    while True:
-        ret = await asyncio.get_event_loop().run_in_executor(
-            None, __try_que_get)
-        if ret is not None:
-            return ret
-        _check_context_alive(mp_context)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if s.connect_ex(('localhost', port)) != 0:
+                return port
+            port += 1
 
 
 class TPModelAgent(AutoModelAgent):
@@ -1032,86 +547,172 @@ class TPModelAgent(AutoModelAgent):
                  model_path: str,
                  model_config: ModelConfig,
                  cache_config: CacheConfig,
+                 backend_config: BackendConfig,
                  world_size: int,
                  adapters: Dict[str, str] = None,
                  trust_remote_code: bool = True) -> None:
-        self.mp_ctx = mp.get_context('spawn')
+        import signal
+
+        def __signal_term_handler(sig, frame):
+            """sigterm handler."""
+            if hasattr(self, 'mp_context'):
+                procs = self.mp_context.processes
+                for p in procs:
+                    if p.is_alive():
+                        p.kill()
+            logger.error(f'Get signal[{sig}], kill all processes.')
+            signal.signal(sig, signal.SIG_DFL)
+            signal.raise_signal(sig)
+
         super().__init__(model_config=model_config, cache_config=cache_config)
+
+        signal.signal(signal.SIGTERM, __signal_term_handler)
+
+        self.mp_ctx = mp.get_context('spawn')
         self.world_size = world_size
-        self.tp_model_in_que = self.mp_ctx.Queue(10)
-        self.tp_model_out_que = self.mp_ctx.Queue(10)
+        self.backend_config = backend_config
 
-        self.patch_model_tp(model_path,
-                            model_config=model_config,
-                            cache_config=cache_config,
-                            adapters=adapters,
-                            in_que=self.tp_model_in_que,
-                            out_que=self.tp_model_out_que,
-                            world_size=world_size,
-                            trust_remote_code=trust_remote_code)
+        self._dist_ctx = None
+        self.mp_bar = self.mp_ctx.Barrier(world_size)
+        self._start_sub_process(model_path,
+                                model_config=model_config,
+                                cache_config=cache_config,
+                                backend_config=backend_config,
+                                adapters=adapters,
+                                world_size=world_size,
+                                barrier=self.mp_bar)
 
-    def patch_model_tp(self, model_path: str, model_config: ModelConfig,
-                       cache_config: CacheConfig, adapters: Dict[str, str],
-                       in_que: mp.Queue, out_que: mp.Queue, world_size: int,
-                       trust_remote_code: bool):
-        """Start tensor parallel sub process.
+        model, cache_engine, cache_config = self._build_model(
+            model_path=model_path,
+            model_config=model_config,
+            cache_config=cache_config,
+            backend_config=backend_config,
+            adapters=adapters,
+            world_size=world_size)
+        self.patched_model = model
+        self.cache_config = cache_config
+        self.cache_engine = cache_engine
+        self.stream = torch.cuda.Stream()
+
+    def _mp_watchdog(self, mp_context: mp.ProcessContext, timeout: int = 1):
+        """watch dog of mp context.
 
         Args:
-            model_path (int): Path of the hugging face model.
-                Could be local or online.
-            extra_args (List[str]): The extra arguments to add to the
-                patched model.
-            model_config (ModelConfig): The config of the model.
-            cache_config (CacheConfig): The config of the cache.
-            in_que (mp.Queue): Input queue. Used to receive model input.
-            out_que (mp.Queue): Output queue. Used to send the model output.
-            world_size (int): The distribution world size.
+            mp_context: context of multiprocess.
+            timeout: timeout
         """
+        import time
+        while True:
+            _check_context_alive(mp_context)
+            time.sleep(timeout)
 
-        def __find_available_port() -> bool:
-            """find available port."""
-            import socket
-            port = 29500
-            while True:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    if s.connect_ex(('localhost', port)) != 0:
-                        return port
-                    port += 1
+    def _start_sub_process(self, model_path: str, model_config: ModelConfig,
+                           cache_config: CacheConfig,
+                           backend_config: BackendConfig, adapters: Dict[str,
+                                                                         str],
+                           world_size: int, barrier: mp.Barrier):
+        """Start tensor parallel sub process."""
+        port = _find_available_port()
+        os.environ.setdefault('MASTER_ADDR', '127.0.0.1')
+        os.environ.setdefault('MASTER_PORT', str(port))
+        addr = os.environ['MASTER_ADDR']
+        port = os.environ['MASTER_PORT']
+        logger.info(f'MASTER_ADDR={addr}, MASTER_PORT={port}')
 
+        device_context = get_device_manager().current_context()
         self.mp_context = mp.spawn(
             _start_tp_process,
             args=(
                 world_size,
                 _tp_model_loop,
+                logger.level,
+                device_context,
                 (model_path, ),
-                dict(model_config=model_config,
-                     cache_config=cache_config,
-                     adapters=adapters,
-                     in_que=in_que,
-                     out_que=out_que,
-                     world_size=world_size,
-                     trust_remote_code=trust_remote_code),
-                __find_available_port(),
+                dict(
+                    model_config=model_config,
+                    cache_config=cache_config,
+                    backend_config=backend_config,
+                    adapters=adapters,
+                    world_size=world_size,
+                    barrier=barrier,
+                ),
             ),
-            nprocs=world_size,
+            nprocs=world_size - 1,
             join=False,
             daemon=True,
         )
-        resp: TPResponse = _queue_get_response(out_que, self.mp_context)
-        if resp.ret_code != 0:
-            logger.error(f'Init tp model failed with error: {resp.error}')
-            raise next(err for err in resp.error if err is not None)
-        self.cache_config = resp.data
 
-    def paging_adapters(self, weight_maps: List[AdapterWeightMap]):
-        """load adapter."""
-        if not weight_maps:
-            return
-        self.tp_model_in_que.put(weight_maps)
-        resp: TPResponse = self.tp_model_out_que.get()
-        if resp.ret_code != 0:
-            logger.error(f'paging adapters failed with error: {resp.error}')
-            raise next(err for err in resp.error if err is not None)
+        t_watchdog = threading.Thread(target=self._mp_watchdog,
+                                      args=[self.mp_context, 1.0],
+                                      daemon=True)
+        t_watchdog.start()
+
+        rank = 0
+        try:
+            dist.init_process_group('nccl',
+                                    rank=rank,
+                                    world_size=world_size,
+                                    timeout=timedelta(days=35600))
+            dist_ctx = DistContext(rank=rank, world_size=world_size)
+            self._dist_ctx = dist_ctx
+        except Exception as e:
+            from traceback import print_exc
+            logger.error(f'Rank[{rank}] failed.')
+            print_exc()
+            if dist.is_initialized():
+                dist.destroy_process_group()
+            raise e
+        atexit.register(_exit_handler, self)
+
+    @torch.inference_mode()
+    def _build_model(
+        self,
+        model_path: str,
+        model_config: ModelConfig,
+        cache_config: CacheConfig,
+        backend_config: BackendConfig,
+        adapters: Dict[str, str],
+        world_size: int,
+    ):
+        """build model."""
+        with get_dist_manager().context(self._dist_ctx):
+            rank = 0
+            model, cache_engine, cache_config = _tp_build_model(
+                rank,
+                model_path=model_path,
+                model_config=model_config,
+                cache_config=cache_config,
+                backend_config=backend_config,
+                adapters=adapters,
+                world_size=world_size,
+            )
+
+        return model, cache_engine, cache_config
+
+    def get_block_numel(self):
+        """get block nelement."""
+        k_cache = self.cache_engine.local_gpu_cache[0][0]
+        return k_cache[0].numel()
+
+    def _forward_impl(self, inputs: ModelInputs, swap_in_map: SwapMap,
+                      swap_out_map: SwapMap):
+        """forward impl."""
+        with get_dist_manager().context(self._dist_ctx):
+            self.mp_bar.wait()
+            rank = 0
+            _broadcast_inputs(rank, [inputs, swap_in_map, swap_out_map],
+                              self.stream)
+            cache_swapping(self.cache_engine,
+                           swap_in_map=swap_in_map,
+                           swap_out_map=swap_out_map)
+            output = model_forward(
+                self.patched_model,
+                inputs,
+                self.cache_engine,
+                world_size=1,
+                stream=self.stream,
+            )
+        return output
 
     def forward(self, inputs: ModelInputs, swap_in_map: SwapMap,
                 swap_out_map: SwapMap):
@@ -1119,18 +720,14 @@ class TPModelAgent(AutoModelAgent):
 
         Args:
             inputs (Dict): The input data comes from _make_inputs.
-            swap_in_map (Dict[int, int]): Cache maps to swap in.
-            swap_out_map (Dict[int, int]): Cache maps to swap out.
+            swap_in_map (SwapMap): Cache maps to swap in.
+            swap_out_map (SwapMap): Cache maps to swap out.
         """
-        with torch.no_grad():
-            self.tp_model_in_que.put((inputs, swap_in_map, swap_out_map))
-
-        resp: TPResponse = _queue_get_response(self.tp_model_out_que,
-                                               self.mp_context)
-        if resp.ret_code != 0:
-            raise RuntimeError('tp forward failed.')
-
-        return resp.data
+        output = self._forward_impl(inputs,
+                                    swap_in_map=swap_in_map,
+                                    swap_out_map=swap_out_map)
+        self.stream.synchronize()
+        return output
 
     async def async_forward(self, inputs: ModelInputs, swap_in_map: SwapMap,
                             swap_out_map: SwapMap):
@@ -1138,37 +735,61 @@ class TPModelAgent(AutoModelAgent):
 
         Args:
             inputs (Dict): The input data comes from _make_inputs.
-            swap_in_map (Dict[int, int]): Cache maps to swap in.
-            swap_out_map (Dict[int, int]): Cache maps to swap out.
+            swap_in_map (SwapMap): Cache maps to swap in.
+            swap_out_map (SwapMap): Cache maps to swap out.
         """
-        with torch.no_grad():
-            self.tp_model_in_que.put((inputs, swap_in_map, swap_out_map))
+        output = self._forward_impl(inputs,
+                                    swap_in_map=swap_in_map,
+                                    swap_out_map=swap_out_map)
+        await asyncio.get_event_loop().run_in_executor(None,
+                                                       self.stream.synchronize)
+        return output
 
-        resp: TPResponse = await _async_queue_get_response(
-            self.tp_model_out_que, self.mp_context)
-        if resp.ret_code != 0:
-            raise RuntimeError('tp forward failed.')
-        return resp.data
+    def get_logits(self, hidden_states: torch.Tensor):
+        """get logits of model output."""
+        return self.patched_model.get_logits(hidden_states)
+
+
+def _exit_handler(agent: TPModelAgent):
+    if hasattr(agent, 'patched_model'):
+        del agent.patched_model
 
 
 def build_model_agent(model_path: str,
                       cache_config: CacheConfig,
+                      backend_config: BackendConfig,
                       trust_remote_code: bool,
                       adapters: Dict[str, str] = None,
-                      tp: int = 1):
-    """create model agent."""
+                      tp: int = 1,
+                      dtype: str = 'auto',
+                      custom_module_map: str = None):
+    """create model agent.
+
+    Args:
+        model_path (str): the path of the input model
+        cache_config (CacheConfig): config of kv cache
+        backend_config (BackendConfig): config of backend devices
+        trust_remote_code (bool): To use the remote modeling code or not
+        adapters (Dict): lora adapters
+        tp (int): the number of devices to be used in tensor parallelism
+        dtype (str): the data type of model weights and activations
+        custom_module_map (str): customized nn module map
+    """
     model_config = ModelConfig.from_pretrained(
-        model_path, trust_remote_code=trust_remote_code)
+        model_path, trust_remote_code=trust_remote_code, dtype=dtype)
+    model_config.custom_module_map = custom_module_map
     if tp == 1:
         model_agent = BaseModelAgent(model_path,
                                      model_config=model_config,
                                      cache_config=cache_config,
+                                     backend_config=backend_config,
                                      adapters=adapters,
                                      trust_remote_code=trust_remote_code)
     else:
         model_agent = TPModelAgent(model_path,
                                    model_config=model_config,
                                    cache_config=cache_config,
+                                   backend_config=backend_config,
                                    world_size=tp,
                                    adapters=adapters,
                                    trust_remote_code=trust_remote_code)
