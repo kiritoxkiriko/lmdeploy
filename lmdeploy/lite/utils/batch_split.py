@@ -5,7 +5,8 @@ import torch
 
 
 def split_decoder_layer_inputs(
-    *args: Union[torch.Tensor, Any], **kwargs: Union[torch.Tensor, Any]
+    batch_size, *args: Union[torch.Tensor, Any], **kwargs: Union[torch.Tensor,
+                                                                 Any]
 ) -> Tuple[List[List[Any]], List[Dict[str, Any]]]:
     """This function splits batched decoder layer inputs into individual
     elements.
@@ -29,14 +30,14 @@ def split_decoder_layer_inputs(
 
     batch_args = []
     batch_kwargs = []
-    for i in range(bs):
+    for i in range(0, bs, batch_size):
         new_args = []
         # Iterate over each argument. If it's a torch.Tensor and its first
         # dimension equals the batch size, then get the value corresponding
         # to the current index, else directly add the whole value.
         for val in args:
             if isinstance(val, torch.Tensor) and val.size(0) == bs:
-                new_args.append(val[i:i + 1])
+                new_args.append(val[i:i + batch_size])
             else:
                 new_args.append(val)
 
@@ -44,7 +45,7 @@ def split_decoder_layer_inputs(
         # Execute the same operation for the keyword arguments.
         for name, val in kwargs.items():
             if isinstance(val, torch.Tensor) and val.size(0) == bs:
-                new_kwargs[name] = val[i:i + 1]
+                new_kwargs[name] = val[i:i + batch_size]
             else:
                 new_kwargs[name] = val
 
@@ -95,6 +96,8 @@ def concat_decoder_layer_outputs(
             key = torch.cat([out[i][0] for out in batch_outputs])
             value = torch.cat([out[i][1] for out in batch_outputs])
             out_i = (key, value)
+        elif batch_outputs[0][i] is None:  # glm4
+            out_i = None
         else:
             # If it's not a past key-value pair, concatenate directly.
             out_i = torch.cat([out[i] for out in batch_outputs])

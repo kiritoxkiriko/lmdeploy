@@ -1,44 +1,48 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-from transformers import AutoConfig
-
+from lmdeploy.archs import get_model_arch
 from lmdeploy.utils import get_logger
 
 logger = get_logger('lmdeploy')
 
-_SUPPORTED_ARCHS = dict(
+SUPPORTED_ARCHS = dict(
     # baichuan-7b
-    BaiChuanForCausalLM=True,
+    BaiChuanForCausalLM='baichuan',
     # baichuan2-7b, baichuan-13b, baichuan2-13b
-    BaichuanForCausalLM=True,
-    # chatglm2-6b, chatglm3-6b
-    ChatGLMModel=False,
-    # deepseek-moe
-    DeepseekForCausalLM=False,
-    # falcon-7b
-    FalconForCausalLM=False,
-    # gemma-7b
-    GemmaForCausalLM=False,
+    BaichuanForCausalLM='baichuan2',
     # internlm
-    InternLMForCausalLM=True,
+    InternLMForCausalLM='llama',
     # internlm2
-    InternLM2ForCausalLM=True,
-    # internlm-xcomposer
-    InternLMXComposerForCausalLM=True,
-    # internlm2-xcomposer
-    InternLM2XComposerForCausalLM=False,
+    InternLM2ForCausalLM='internlm2',
     # llama, llama2, alpaca, vicuna, codellama, ultracm, yi,
     # deepseek-coder, deepseek-llm
-    LlamaForCausalLM=True,
-    # Mistral-7B
-    MistralForCausalLM=False,
-    # Mixtral-8x7B
-    MixtralForCausalLM=False,
+    LlamaForCausalLM='llama',
     # Qwen 7B-72B, Qwen-VL-7B
-    QWenLMHeadModel=True,
-    # Qwen1.5 7B-72B
-    Qwen2ForCausalLM=False,
+    QWenLMHeadModel='qwen',
+    # Qwen2
+    Qwen2ForCausalLM='qwen2',
+    # mistral
+    MistralForCausalLM='llama',
     # llava
-    LlavaLlamaForCausalLM=True)
+    LlavaLlamaForCausalLM='llama',
+    LlavaMistralForCausalLM='llama',
+    # xcomposer2
+    InternLMXComposer2ForCausalLM='xcomposer2',
+    # internvl
+    InternVLChatModel='internvl',
+    # deepseek-vl
+    MultiModalityCausalLM='deepseekvl',
+    # MiniCPMV
+    MiniCPMV='minicpmv',
+    # mini gemini
+    MGMLlamaForCausalLM='llama',
+    MiniGeminiLlamaForCausalLM='llama',
+    # chatglm2/3, glm4
+    ChatGLMModel='glm4',
+    ChatGLMForConditionalGeneration='glm4',
+    # mixtral
+    MixtralForCausalLM='mixtral',
+    MLMInternVLChatModel='internvl',
+    )
 
 
 def is_supported(model_path: str):
@@ -63,28 +67,39 @@ def is_supported(model_path: str):
     """  # noqa: E501
     import os
 
+    def _is_head_dim_128(cfg):
+        num_attn_head = cfg.num_attention_heads
+        hidden_size = cfg.hidden_size
+        # turbomind support head_dim=128
+        return (hidden_size // num_attn_head) == 128
+
     support_by_turbomind = False
     triton_model_path = os.path.join(model_path, 'triton_models')
     if os.path.exists(triton_model_path):
         support_by_turbomind = True
     else:
-        cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        arch, cfg = get_model_arch(model_path)
 
-        if hasattr(cfg, 'architectures'):
-            arch = cfg.architectures[0]
-        elif hasattr(cfg,
-                     'auto_map') and 'AutoModelForCausalLM' in cfg.auto_map:
-            arch = cfg.auto_map['AutoModelForCausalLM'].split('.')[-1]
-        else:
-            raise RuntimeError(
-                f'Could not find model architecture from config: {cfg}')
-
-        if arch in _SUPPORTED_ARCHS:
-            support_by_turbomind = _SUPPORTED_ARCHS[arch]
+        if arch in SUPPORTED_ARCHS.keys():
+            support_by_turbomind = True
             # special cases
             if arch == 'BaichuanForCausalLM':
                 num_attn_head = cfg.num_attention_heads
                 if num_attn_head == 40:
                     # baichuan-13B, baichuan2-13B not supported by turbomind
                     support_by_turbomind = False
+            elif arch in ['Qwen2ForCausalLM', 'LlamaForCausalLM']:
+                # the head_dim of qwen2 0.5b and llama3.2-1b is 64, which
+                # hasn't been supported by turbomind yet
+                support_by_turbomind = _is_head_dim_128(cfg)
+            elif arch in ('ChatGLMModel', 'ChatGLMForConditionalGeneration'):
+                # chatglm1/2/3 is not working yet
+                support_by_turbomind = cfg.num_layers == 40
+                if getattr(cfg, 'vision_config', None) is not None:
+                    # glm-4v-9b not supported
+                    support_by_turbomind = False
+            elif arch == 'InternVLChatModel':
+                # internvl2-4b,internlm2-1b are not working yet
+                support_by_turbomind = _is_head_dim_128(cfg.llm_config)
+
     return support_by_turbomind

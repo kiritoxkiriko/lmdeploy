@@ -14,16 +14,16 @@ def run(model_path_or_server: str,
         backend_config: Optional[Union[PytorchEngineConfig,
                                        TurbomindEngineConfig]] = None,
         chat_template_config: Optional[ChatTemplateConfig] = None,
-        tp: int = 1,
         model_name: str = None,
+        share: bool = False,
+        max_log_len: int = None,
         **kwargs):
     """chat with AI assistant through web ui.
 
     Args:
-        model_path_or_server (str): the path of the deployed model or the
-            tritonserver URL or restful api URL. For example:
-            - ./workspace
-            - 0.0.0.0:23333
+        model_path_or_server (str): the path of the deployed model or
+        restful api URL. For example:
+            - huggingface hub repo_id
             - http://0.0.0.0:23333
         server_name (str): the ip address of gradio server
         server_port (int): the port of gradio server
@@ -34,22 +34,21 @@ def run(model_path_or_server: str,
             config instance. Default to none.
         chat_template_config (ChatTemplateConfig): chat template configuration.
             Default to None.
-        tp (int): tensor parallel for Turbomind
+        share (bool): whether to create a publicly shareable link for the app,
+        max_log_len (int): Max number of prompt characters or prompt tokens
+            being printed in log. Default: Unlimited
     """
     if ':' in model_path_or_server:
-        if 'http:' in model_path_or_server:
-            from lmdeploy.serve.gradio.api_server_backend import run_api_server
-            run_api_server(model_path_or_server, server_name, server_port,
-                           batch_size)
-        else:
-            from lmdeploy.serve.gradio.triton_server_backend import \
-                run_triton_server
-            run_triton_server(model_path_or_server, server_name, server_port)
+        from lmdeploy.serve.gradio.api_server_backend import run_api_server
+        run_api_server(model_path_or_server,
+                       server_name,
+                       server_port,
+                       batch_size,
+                       share=share)
     else:
         pipeline_type, _ = get_task(model_path_or_server)
         if pipeline_type == 'vlm':
             from lmdeploy.serve.gradio.vl import run_local
-            assert backend == 'turbomind', 'vlm only support turbomind backend'
             if backend_config is not None and \
                     backend_config.session_len is None:
                 backend_config.session_len = 8192
@@ -63,7 +62,7 @@ def run(model_path_or_server: str,
                   chat_template_config=chat_template_config,
                   model_name=model_name,
                   batch_size=batch_size,
-                  tp=tp,
+                  share=share,
                   **kwargs)
 
 

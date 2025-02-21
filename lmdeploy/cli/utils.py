@@ -61,6 +61,30 @@ def get_lora_adapters(adapters: List[str]):
     return output
 
 
+def get_chat_template(chat_template: str):
+    """get chat template config.
+
+    Args
+        chat_template(str): it could be a builtin chat template name,
+        or a chat template json file
+    """
+    import os
+
+    from lmdeploy.model import ChatTemplateConfig
+    if chat_template:
+        if os.path.isfile(chat_template):
+            return ChatTemplateConfig.from_json(chat_template)
+        else:
+            from lmdeploy.model import MODELS
+            assert chat_template in MODELS.module_dict.keys(), \
+                f"chat template '{chat_template}' is not " \
+                f'registered. The builtin chat templates are: ' \
+                f'{MODELS.module_dict.keys()}'
+            return ChatTemplateConfig(model_name=chat_template)
+    else:
+        return None
+
+
 class ArgumentHelper:
     """Helper class to add unified argument."""
 
@@ -72,10 +96,22 @@ class ArgumentHelper:
             '--model-name',
             type=str,
             default=None,
-            help='The name of the to-be-deployed model, such as'
-            ' llama-7b, llama-13b, vicuna-7b and etc. You '
-            'can run `lmdeploy list` to get the supported '
-            'model names')
+            help='The name of the served model. It can be accessed '
+            'by the RESTful API `/v1/models`. If it is not specified, '
+            '`model_path` will be adopted')
+
+    @staticmethod
+    def dtype(parser, default: str = 'auto'):
+        return parser.add_argument(
+            '--dtype',
+            type=str,
+            default=default,
+            choices=['auto', 'float16', 'bfloat16'],
+            help='data type for model weights and activations. '
+            'The "auto" option will use FP16 precision '
+            'for FP32 and FP16 models, and BF16 precision '
+            'for BF16 models. This option will be ignored if '
+            'the model is a quantized model')
 
     @staticmethod
     def model_format(parser, default: str = None):
@@ -83,9 +119,29 @@ class ArgumentHelper:
             '--model-format',
             type=str,
             default=default,
-            choices=['hf', 'llama', 'awq'],
-            help='The format of input model. `hf` meaning `hf_llama`, `llama` '
-            'meaning `meta_llama`, `awq` meaning the quantized model by awq')
+            choices=['hf', 'llama', 'awq', 'gptq'],
+            help='The format of input model. `hf` means `hf_llama`, `llama` '
+            'means `meta_llama`, `awq` represents the quantized model by AWQ,'
+            ' and `gptq` refers to the quantized model by GPTQ')
+
+    @staticmethod
+    def revision(parser, default: str = None):
+        return parser.add_argument(
+            '--revision',
+            type=str,
+            default=default,
+            help='The specific model version to use. '
+            'It can be a branch name, a tag name, or a commit id. '
+            'If unspecified, will use the default version.')
+
+    @staticmethod
+    def download_dir(parser, default: str = None):
+        return parser.add_argument(
+            '--download-dir',
+            type=str,
+            default=default,
+            help='Directory to download and load the weights, '
+            'default to the default cache directory of huggingface.')
 
     @staticmethod
     def tp(parser):
@@ -117,19 +173,23 @@ class ArgumentHelper:
     def max_batch_size(parser):
         """Add argument max_batch_size to parser."""
 
-        return parser.add_argument('--max-batch-size',
-                                   type=int,
-                                   default=128,
-                                   help='Maximum batch size')
+        return parser.add_argument(
+            '--max-batch-size',
+            type=int,
+            default=None,
+            help='Maximum batch size. If not specified, the engine will '
+            'automatically set it according to the device')
 
     @staticmethod
-    def quant_policy(parser):
+    def quant_policy(parser, default: int = 0):
         """Add argument quant_policy to parser."""
 
-        return parser.add_argument('--quant-policy',
-                                   type=int,
-                                   default=0,
-                                   help='Whether to use kv int8')
+        return parser.add_argument(
+            '--quant-policy',
+            type=int,
+            default=0,
+            choices=[0, 4, 8],
+            help='Quantize kv or not. 0: no quant; 4: 4bit kv; 8: 8bit kv')
 
     @staticmethod
     def rope_scaling_factor(parser):
@@ -202,18 +262,6 @@ class ArgumentHelper:
                                    help='Parameter to penalize repetition')
 
     @staticmethod
-    def cap(parser):
-        """Add argument cap to parser."""
-
-        return parser.add_argument(
-            '--cap',
-            type=str,
-            default='chat',
-            choices=['completion', 'infilling', 'chat', 'python'],
-            help='The capability of a model. '
-            'Deprecated. Please use --chat-template instead')
-
-    @staticmethod
     def log_level(parser):
         """Add argument log_level to parser."""
 
@@ -250,16 +298,6 @@ class ArgumentHelper:
         """Add argument backend to parser."""
 
         return parser.add_argument('--backend',
-                                   type=str,
-                                   default='turbomind',
-                                   choices=['pytorch', 'turbomind'],
-                                   help='Set the inference backend')
-
-    @staticmethod
-    def engine(parser):
-        """Add argument engine to parser."""
-
-        return parser.add_argument('--engine',
                                    type=str,
                                    default='turbomind',
                                    choices=['pytorch', 'turbomind'],
@@ -303,25 +341,40 @@ class ArgumentHelper:
                                    help='The sequence length for calibration')
 
     @staticmethod
-    def device(parser):
+    def calib_batchsize(parser):
+        """Add argument batch_size to parser."""
+
+        return parser.add_argument(
+            '--batch-size',
+            type=int,
+            default=1,
+            help=\
+            'The batch size for running the calib samples. Low GPU mem requires small batch_size. Large batch_size reduces the calibration time while costs more VRAM'  # noqa
+        )
+
+    @staticmethod
+    def calib_search_scale(parser):
+        """Add argument batch_size to parser."""
+
+        return parser.add_argument(
+            '--search-scale',
+            type=bool,
+            default=False,
+            help=\
+            'Whether search scale ratio. Default to False, which means only smooth quant with 0.5 ratio will be applied'  # noqa
+        )
+
+    @staticmethod
+    def device(parser,
+               default: str = 'cuda',
+               choices: List[str] = ['cuda', 'ascend', 'maca']):
         """Add argument device to parser."""
 
         return parser.add_argument('--device',
                                    type=str,
-                                   default='cuda',
-                                   choices=['cuda', 'cpu'],
-                                   help='Device type of running')
-
-    @staticmethod
-    def meta_instruction(parser):
-        """Add argument meta_instruction to parser."""
-
-        return parser.add_argument(
-            '--meta-instruction',
-            type=str,
-            default=None,
-            help='System prompt for ChatTemplateConfig. Deprecated. '
-            'Please use --chat-template instead')
+                                   default=default,
+                                   choices=choices,
+                                   help='The device type of running')
 
     @staticmethod
     def chat_template(parser):
@@ -344,7 +397,8 @@ class ArgumentHelper:
             '--cache-max-entry-count',
             type=float,
             default=0.8,
-            help='The percentage of gpu memory occupied by the k/v cache')
+            help='The percentage of free gpu memory occupied by the k/v '
+            'cache, excluding weights ')
 
     @staticmethod
     def adapters(parser):
@@ -369,3 +423,85 @@ class ArgumentHelper:
             type=str,
             default='./work_dir',
             help='The working directory to save results')
+
+    @staticmethod
+    def cache_block_seq_len(parser):
+        """Add argument cache_block_seq_len to parser."""
+
+        return parser.add_argument(
+            '--cache-block-seq-len',
+            type=int,
+            default=64,
+            help='The length of the token sequence in a k/v block. '
+            'For Turbomind Engine, if the GPU compute capability '
+            'is >= 8.0, it should be a multiple of 32, otherwise '
+            'it should be a multiple of 64. For Pytorch Engine, '
+            'if Lora Adapter is specified, this parameter will '
+            'be ignored')
+
+    @staticmethod
+    def enable_prefix_caching(parser):
+        """Add argument enable_prefix_caching to parser."""
+
+        return parser.add_argument('--enable-prefix-caching',
+                                   action='store_true',
+                                   default=False,
+                                   help='Enable cache and match prefix')
+
+    @staticmethod
+    def num_tokens_per_iter(parser):
+        return parser.add_argument(
+            '--num-tokens-per-iter',
+            type=int,
+            default=0,
+            help='the number of tokens processed in a forward pass')
+
+    @staticmethod
+    def max_prefill_iters(parser):
+        return parser.add_argument(
+            '--max-prefill-iters',
+            type=int,
+            default=1,
+            help='the max number of forward passes in prefill stage')
+
+    @staticmethod
+    def max_prefill_token_num(parser):
+        return parser.add_argument(
+            '--max-prefill-token-num',
+            type=int,
+            default=8192,
+            help='the max number of tokens per iteration during prefill')
+
+    @staticmethod
+    def vision_max_batch_size(parser):
+        return parser.add_argument('--vision-max-batch-size',
+                                   type=int,
+                                   default=1,
+                                   help='the vision model batch size')
+
+    @staticmethod
+    def max_log_len(parser):
+        return parser.add_argument(
+            '--max-log-len',
+            type=int,
+            default=None,
+            help='Max number of prompt characters or prompt tokens being'
+            'printed in log. Default: Unlimited')
+
+    @staticmethod
+    def disable_fastapi_docs(parser):
+        return parser.add_argument('--disable-fastapi-docs',
+                                   action='store_true',
+                                   default=False,
+                                   help="Disable FastAPI's OpenAPI schema,"
+                                   ' Swagger UI, and ReDoc endpoint')
+
+    @staticmethod
+    def eager_mode(parser):
+        """Add argument eager_mode to parser."""
+
+        return parser.add_argument('--eager-mode',
+                                   action='store_true',
+                                   default=False,
+                                   help='Whether to enable eager mode. '
+                                   'If True, cuda graph would be disabled')

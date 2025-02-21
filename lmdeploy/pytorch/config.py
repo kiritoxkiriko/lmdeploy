@@ -1,21 +1,55 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-from dataclasses import dataclass, field
-from typing import Any, Dict
+from dataclasses import dataclass
+from typing import Any, Dict, List, Literal
 
 import torch
 
 
-def _get_torch_dtype(config: Any, default: str = 'float16'):
-    """Get the torch dtype from the model config.
+def _update_torch_dtype(config: 'ModelConfig', dtype: str):
+    """Update the torch dtype from the model config.
 
     Args:
-        config: Config of the hf model.
-        default (str): default device type.
+        config (ModelConfig): The input model config.
+        dtype (str): user specified data type. Refer to
+            `PyTorchEngineConfig.dtype` for detailed info
     """
-    torch_dtype = getattr(config, 'torch_dtype', default)
-    # torch_dtype in config could be none
-    torch_dtype = torch_dtype or default
-    return eval(f'torch.{torch_dtype}')
+    from lmdeploy.utils import get_logger
+    logger = get_logger('lmdeploy')
+
+    quantization_config = getattr(config.hf_config, 'quantization_config',
+                                  dict())
+    quant_method = quantization_config.get('quant_method', None)
+    if quant_method == 'awq':
+        logger.debug('set torch_dtype to float16 for awq.')
+        config.hf_config.torch_dtype = 'float16'
+        config.dtype = torch.float16
+        return config
+
+    torch_dtype = getattr(config.hf_config, 'torch_dtype', None)
+    if torch_dtype is None:
+        _dtype = 'float16' if dtype == 'auto' else dtype
+        logger.warning('Model config does not have `torch_dtype`,'
+                       f' use: {_dtype}')
+        torch_dtype = _dtype
+        # update hf_config as well
+        setattr(config.hf_config, 'torch_dtype', torch_dtype)
+    else:
+        # change to user specified data type if it is not 'auto'
+        if dtype == 'auto':
+            torch_dtype = torch_dtype if torch_dtype in [
+                torch.float16, torch.bfloat16
+            ] else torch.float16
+        else:
+            torch_dtype = dtype
+    config.dtype = eval(f'torch.{torch_dtype}')
+    return config
+
+
+@dataclass
+class BackendConfig:
+    """backend config."""
+    eager_mode: bool = True
+    device_type: str = 'cuda'
 
 
 @dataclass
@@ -34,12 +68,24 @@ class SchedulerConfig:
 class CacheConfig:
     """Config of key value cache."""
 
+    max_batches: int
     block_size: int
     num_cpu_blocks: int
     num_gpu_blocks: int
     window_size: int = -1
     cache_max_entry_count: float = 0.8
     max_prefill_token_num: int = 4096
+    enable_prefix_caching: bool = False
+    quant_policy: Literal[0, 4, 8] = 0
+
+    def __post_init__(self):
+        """post init."""
+        from lmdeploy.utils import get_logger
+        logger = get_logger('lmdeploy')
+        if self.window_size > 1 and self.enable_prefix_caching:
+            logger.warning(
+                'Prefix caching is not available for window attention.')
+            self.enable_prefix_caching = False
 
 
 @dataclass
@@ -51,15 +97,17 @@ class ModelConfig:
     num_attention_heads: int
     num_key_value_heads: int
     bos_token_id: int
-    eos_token_id: int
+    eos_token_id: List[int]
     head_dim: int
+    k_head_dim: int = None
+    v_head_dim: int = None
     sliding_window: int = -1
     dtype: torch.dtype = torch.float16
     multi_query_attention: bool = False
     vocab_size: int = 40000
-    json_config: dict = field(default_factory=dict)
     hf_config: Any = None
-    init_kwargs: Dict[str, Any] = field(default_factory=dict)
+    cogvlm_style: bool = False
+    custom_module_map: Dict[str, setattr] = None
 
     def get_head_size(self):
         """get head size."""
@@ -68,104 +116,51 @@ class ModelConfig:
     @classmethod
     def from_pretrained(cls,
                         pretrained_model_name_or_path: str,
-                        trust_remote_code: bool = True):
-        """build ModelConfig from model path or name."""
+                        trust_remote_code: bool = True,
+                        dtype: str = 'auto'):
+        """Instantiate one of the configuration classes of the library from a
+        pretrained model configuration.
+
+        Args:
+            pretrained_model_name_or_path (str): the pretrained model path
+            trust_remote_code (bool):  Whether or not to allow for custom
+                models defined on the Hub in their own modeling files.
+            dtype (str): user specified data type for model weights and
+                activations. Refer to `PyTorchEngineConfig` for details
+        """
         from transformers import AutoConfig
         hf_config = AutoConfig.from_pretrained(
             pretrained_model_name_or_path, trust_remote_code=trust_remote_code)
-        return cls.from_hf_config(hf_config, pretrained_model_name_or_path)
+        if getattr(hf_config, 'model_type', None) in ['phi3']:
+            # phi3 + trust_remote_code leads to error when tp.
+            hf_config = AutoConfig.from_pretrained(
+                pretrained_model_name_or_path)
+        return cls.from_hf_config(hf_config,
+                                  pretrained_model_name_or_path,
+                                  dtype=dtype)
 
     @classmethod
-    def from_hf_config(cls, hf_config: Any, model_path: str = None):
+    def from_hf_config(cls,
+                       hf_config: Any,
+                       model_path: str = None,
+                       dtype: str = 'auto'):
         """from huggingface config."""
-        if model_path is None:
-            model_path = ''
+        from lmdeploy.pytorch.configurations import AutoModelConfigBuilder
 
-        def __build_falcon():
-            """build falcon."""
-            num_attention_heads = hf_config.num_attention_heads
-            if hf_config.new_decoder_architecture:
-                # 40b-instruct, GQA
-                kv_head = hf_config.num_kv_heads
-            if hf_config.multi_query:
-                # 7b-instruct, MQA
-                kv_head = 1
-            else:
-                # rw-1b, MHA
-                kv_head = num_attention_heads
-            head_dim = hf_config.hidden_size // num_attention_heads
-            return ModelConfig(
-                hidden_size=hf_config.hidden_size,
-                num_layers=hf_config.num_hidden_layers,
-                num_attention_heads=num_attention_heads,
-                num_key_value_heads=kv_head,
-                bos_token_id=hf_config.bos_token_id,
-                eos_token_id=hf_config.eos_token_id,
-                head_dim=head_dim,
-                multi_query_attention=hf_config.multi_query,
-                vocab_size=hf_config.vocab_size,
-            )
+        model_config = AutoModelConfigBuilder.build(hf_config, model_path)
 
-        def __build_chatglm():
-            """build chatglm."""
-            head_dim = hf_config.hidden_size // hf_config.num_attention_heads
-            bos_token_id = hf_config.bos_token_id
-            if bos_token_id is None:
-                bos_token_id = hf_config.pad_token_id
-            init_kwargs = dict(empty_init=False)
-            return ModelConfig(
-                hidden_size=hf_config.hidden_size,
-                num_layers=hf_config.num_layers,
-                num_attention_heads=hf_config.num_attention_heads,
-                num_key_value_heads=hf_config.multi_query_group_num,
-                bos_token_id=bos_token_id,
-                eos_token_id=hf_config.eos_token_id,
-                head_dim=head_dim,
-                vocab_size=hf_config.padded_vocab_size,
-                init_kwargs=init_kwargs)
+        if model_config.k_head_dim is None:
+            assert model_config.head_dim is not None
+            model_config.k_head_dim = model_config.head_dim
+        if model_config.v_head_dim is None:
+            assert model_config.head_dim is not None
+            model_config.v_head_dim = model_config.head_dim
 
-        def __build_gemma():
-            return ModelConfig(
-                hidden_size=hf_config.hidden_size,
-                num_layers=hf_config.num_hidden_layers,
-                num_attention_heads=hf_config.num_attention_heads,
-                num_key_value_heads=hf_config.num_key_value_heads,
-                bos_token_id=hf_config.bos_token_id,
-                eos_token_id=hf_config.eos_token_id,
-                head_dim=hf_config.head_dim,
-                vocab_size=hf_config.vocab_size)
+        # should after setting `hf_config` and `model_arch` attributes
+        model_config = _update_torch_dtype(model_config, dtype)
 
-        def __build_default():
-            head_dim = hf_config.hidden_size // hf_config.num_attention_heads
-            num_attention_heads = hf_config.num_attention_heads
-            num_key_value_heads = getattr(hf_config, 'num_key_value_heads',
-                                          num_attention_heads)
-            use_sliding_window = getattr(hf_config, 'use_sliding_window', True)
-            sliding_window = -1
-            if use_sliding_window:
-                sliding_window = getattr(hf_config, 'sliding_window',
-                                         sliding_window) or -1
-            return ModelConfig(
-                hidden_size=hf_config.hidden_size,
-                num_layers=hf_config.num_hidden_layers,
-                num_attention_heads=hf_config.num_attention_heads,
-                num_key_value_heads=num_key_value_heads,
-                bos_token_id=hf_config.bos_token_id,
-                eos_token_id=hf_config.eos_token_id,
-                sliding_window=sliding_window,
-                head_dim=head_dim,
-                vocab_size=hf_config.vocab_size)
+        # update eos_token_id to list
+        if isinstance(model_config.eos_token_id, int):
+            model_config.eos_token_id = [model_config.eos_token_id]
 
-        if 'falcon' in model_path:
-            model_config = __build_falcon()
-        elif 'chatglm' in model_path:
-            model_config = __build_chatglm()
-        elif hf_config.model_type == 'gemma':
-            model_config = __build_gemma()
-        else:
-            model_config = __build_default()
-
-        model_config.dtype = _get_torch_dtype(hf_config)
-        model_config.hf_config = hf_config
-        model_config.json_config = hf_config.to_dict()
         return model_config

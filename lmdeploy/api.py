@@ -8,11 +8,11 @@ from .model import ChatTemplateConfig
 
 
 def pipeline(model_path: str,
-             model_name: Optional[str] = None,
              backend_config: Optional[Union[TurbomindEngineConfig,
                                             PytorchEngineConfig]] = None,
              chat_template_config: Optional[ChatTemplateConfig] = None,
-             log_level='ERROR',
+             log_level: str = 'WARNING',
+             max_log_len: int = None,
              **kwargs):
     """
     Args:
@@ -29,14 +29,14 @@ def pipeline(model_path: str,
                     on huggingface.co, such as "internlm/internlm-chat-7b",
                     "Qwen/Qwen-7B-Chat ", "baichuan-inc/Baichuan2-7B-Chat"
                     and so on.
-        model_name (str): needed when model_path is a pytorch model on
-            huggingface.co, such as "internlm/internlm-chat-7b",
-            "Qwen/Qwen-7B-Chat ", "baichuan-inc/Baichuan2-7B-Chat" and so on.
         backend_config (TurbomindEngineConfig | PytorchEngineConfig): backend
             config instance. Default to None.
         chat_template_config (ChatTemplateConfig): chat template configuration.
             Default to None.
-        log_level(str): set log level whose value among [CRITICAL, ERROR, WARNING, INFO, DEBUG]
+        log_level(str): set log level whose value among [CRITICAL, ERROR,
+            WARNING, INFO, DEBUG]
+        max_log_len(int): Max number of prompt characters or prompt tokens
+            being printed in log
 
     Examples:
         >>> # LLM
@@ -57,38 +57,32 @@ def pipeline(model_path: str,
     """ # noqa E501
     if os.getenv('TM_LOG_LEVEL') is None:
         os.environ['TM_LOG_LEVEL'] = log_level
-    from lmdeploy.utils import get_logger
+    from lmdeploy.utils import get_logger, get_model
     logger = get_logger('lmdeploy')
     logger.setLevel(log_level)
 
-    pipeline_type, pipeline_class = get_task(model_path)
-    if pipeline_type == 'vlm':
-        assert (type(backend_config) is TurbomindEngineConfig) or \
-            (backend_config is None), \
-            f'{pipeline_type} model only support turbomind backend.'
+    # model_path is not local path.
+    if not os.path.exists(model_path):
+        download_dir = backend_config.download_dir \
+            if backend_config is not None else None
+        revision = backend_config.revision \
+            if backend_config is not None else None
+        model_path = get_model(model_path, download_dir, revision)
 
-    if pipeline_type == 'llm' and type(
-            backend_config) is not PytorchEngineConfig:
+    _, pipeline_class = get_task(model_path)
+
+    if type(backend_config) is not PytorchEngineConfig:
         # set auto backend mode
         backend_config = autoget_backend_config(model_path, backend_config)
     backend = 'pytorch' if type(
         backend_config) is PytorchEngineConfig else 'turbomind'
     logger.info(f'Using {backend} engine')
-    if 'tp' in kwargs:
-        logger.warning(
-            'The argument "tp" is deprecated and will be removed soon. '
-            'Please set "tp" in "backend_config"')
-        tp = kwargs['tp']
-        kwargs.pop('tp')
-    else:
-        tp = 1 if backend_config is None else backend_config.tp
 
     return pipeline_class(model_path,
-                          model_name=model_name,
                           backend=backend,
                           backend_config=backend_config,
                           chat_template_config=chat_template_config,
-                          tp=tp,
+                          max_log_len=max_log_len,
                           **kwargs)
 
 
@@ -120,9 +114,9 @@ def serve(model_path: str,
                     on huggingface.co, such as "internlm/internlm-chat-7b",
                     "Qwen/Qwen-7B-Chat ", "baichuan-inc/Baichuan2-7B-Chat"
                     and so on.
-        model_name (str): needed when model_path is a pytorch model on
-            huggingface.co, such as "internlm/internlm-chat-7b",
-            "Qwen/Qwen-7B-Chat ", "baichuan-inc/Baichuan2-7B-Chat" and so on.
+        model_name (str): the name of the served model. It can be accessed
+            by the RESTful API `/v1/models`. If it is not specified,
+            `model_path` will be adopted
         backend (str): either `turbomind` or `pytorch` backend. Default to
             `turbomind` backend.
         backend_config (TurbomindEngineConfig | PytorchEngineConfig): backend
@@ -156,11 +150,7 @@ def serve(model_path: str,
         backend_config = autoget_backend_config(model_path, backend_config)
     backend = 'pytorch' if type(
         backend_config) is PytorchEngineConfig else 'turbomind'
-    if 'tp' in kwargs:
-        tp = kwargs['tp']
-        kwargs.pop('tp')
-    else:
-        tp = 1 if backend_config is None else backend_config.tp
+
     task = Process(target=serve,
                    args=(model_path, ),
                    kwargs=dict(model_name=model_name,
@@ -169,7 +159,6 @@ def serve(model_path: str,
                                chat_template_config=chat_template_config,
                                server_name=server_name,
                                server_port=server_port,
-                               tp=tp,
                                log_level=log_level,
                                api_keys=api_keys,
                                ssl=ssl,
