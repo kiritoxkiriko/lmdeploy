@@ -74,6 +74,8 @@ _SUPPORTED_ARCHS = dict(
     MiniCPMVForCausalLM=True,
     # internlm3
     InternLM3ForCausalLM=True,
+    #mlminternvl
+    MLMInternVLChatModel=True
 )
 
 

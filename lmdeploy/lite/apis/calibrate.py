@@ -146,7 +146,7 @@ def make_compatible_internvl_config(model_path):
     can't use `save_pretrained`"""
     from lmdeploy.archs import get_model_arch
     arch, _ = get_model_arch(model_path)
-    if arch == 'InternVLChatModel':
+    if arch == 'InternVLChatModel' or arch == 'MLMInternVLChatModel':
         import transformers
         from packaging import version
         if version.parse(transformers.__version__) >= version.parse('4.45.0'):

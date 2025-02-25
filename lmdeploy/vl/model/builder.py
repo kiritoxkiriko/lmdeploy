@@ -27,6 +27,8 @@ from .qwen2 import Qwen2VLModel  # noqa F401
 from .xcomposer2 import Xcomposer2VisionModel  # noqa F401
 from .yi import YiVisionModel  # noqa F401
 
+from .mlminternvl import MLMInternVLVisionModel  
+
 logger = get_logger('lmdeploy')
 
 
@@ -54,6 +56,8 @@ def load_vl_model(model_path: str,
         max_memory = {i: torch.cuda.mem_get_info(i)[0] for i in range(tp)}
 
     _, hf_config = get_model_arch(model_path)
+    #print(hf_config)
+    #input()
     kwargs = dict(model_path=model_path, with_llm=with_llm, max_memory=max_memory, hf_config=hf_config, backend=backend)
     for name, module in VISION_MODELS.module_dict.items():
         try:

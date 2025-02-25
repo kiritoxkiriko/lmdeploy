@@ -159,4 +159,7 @@ MODULE_MAP.update({
     'InternLM3ForCausalLM': f'{LMDEPLOY_PYTORCH_MODEL_PATH}.internlm3.InternLM3ForCausalLM',
 })
 
+# mlminternvl   
+MODULE_MAP.update({'MLMInternVLChatModel': f'{LMDEPLOY_PYTORCH_MODEL_PATH}.mlminternvl.MLMInternVLChatModel'})
+
 CUSTOM_MODULE_MAP = dict()
