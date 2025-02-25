@@ -28,6 +28,7 @@ def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_
                 best_ratio = ratio
     return best_ratio
 
+'''
 def dynamic_preprocess(image, min_num=1, max_num=6, image_size=448, use_thumbnail=False):
     """copy from https://huggingface.co/OpenGVLab/InternVL-Chat-V1-5."""
     orig_width, orig_height = image.size
@@ -61,13 +62,55 @@ def dynamic_preprocess(image, min_num=1, max_num=6, image_size=448, use_thumbnai
         thumbnail_img = image.resize((image_size, image_size))
         processed_images.append(thumbnail_img)
     return processed_images
+'''
+
+def dynamic_preprocess(image, min_num=1, max_num=6, image_size=448, use_thumbnail=False):     ######
+    """copy from https://huggingface.co/OpenGVLab/InternVL-Chat-V1-5."""
+
+
+    orig_width, orig_height = image.size
+    aspect_ratio = orig_width / orig_height
+
+    #max_num=max(max_dynamic_patch // num_image - use_thumbnail, 1) #####################
+    max_num = int(min(max_num, np.ceil(orig_width/ image_size) * np.ceil(orig_height/image_size))) #######
+
+    # calculate the existing image aspect ratio
+    target_ratios = set((i, j) for n in range(min_num, max_num + 1) for i in range(1, n + 1) for j in range(1, n + 1)
+                        if i * j <= max_num and i * j >= min_num)
+
+    target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
+
+    # find the closest aspect ratio to the target
+    target_aspect_ratio = find_closest_aspect_ratio(aspect_ratio, target_ratios, orig_width, orig_height, image_size)
+
+    # calculate the target width and height
+    target_width = image_size * target_aspect_ratio[0]
+    target_height = image_size * target_aspect_ratio[1]
+    blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
+
+    # resize the image
+    resized_img = image.resize((target_width, target_height))
+    processed_images = []
+    for i in range(blocks):
+        box = ((i % (target_width // image_size)) * image_size, (i // (target_width // image_size)) * image_size,
+               ((i % (target_width // image_size)) + 1) * image_size,
+               ((i // (target_width // image_size)) + 1) * image_size)
+        # split the image
+        split_img = resized_img.crop(box)
+        processed_images.append(split_img)
+    assert len(processed_images) == blocks
+    if use_thumbnail and len(processed_images) != 1:
+        thumbnail_img = image.resize((image_size, image_size))
+        processed_images.append(thumbnail_img)
+    return processed_images
+
 
 
 @VISION_MODELS.register_module()
-class InternVLVisionModel(VisonModel):
+class MLMInternVLVisionModel(VisonModel):
     """InternVL vision model."""
 
-    _arch = 'InternVLChatModel'
+    _arch = 'MLMInternVLChatModel'
 
     def __init__(self,
                  model_path: str,
@@ -139,7 +182,7 @@ class InternVLVisionModel(VisonModel):
         # avoid randomness in inference.
         self.model = model.eval()
 
-    def _preprocess_v1_5(self, image,params=None):
+    def _preprocess_v1_5(self, image, num_image, params=None):
  
  
         self.config.max_dynamic_patch = 30
@@ -151,7 +194,7 @@ class InternVLVisionModel(VisonModel):
             max_num = image_res.get(res_key, self.config.max_dynamic_patch)
         out = dynamic_preprocess(image,
                                  min_num=self.config.min_dynamic_patch,
-                                 max_num=max_num,
+                                 max_num=max(self.config.max_dynamic_patch // num_image - self.config.use_thumbnail, 1),
                                  image_size=self.config.vision_config.image_size, 
                                  use_thumbnail=self.config.use_thumbnail)
         pixel_values = [self.transform(x) for x in out]
@@ -198,9 +241,13 @@ class InternVLVisionModel(VisonModel):
         images = self.collect_images(messages)
         outputs = []
 
+        num_image = 0
+        for image in images:
+            num_image += 1
+
         for image, params in images:
             image = image.convert('RGB')
-            pixel_values = self.processor(image=image, params=params)
+            pixel_values = self.processor(image=image, params=params,num_image=num_image)
             image_tokens = (pixel_values.shape[0] * self.image_tokens_per_patch)
             outputs.append(
                 dict(pixel_values=pixel_values, image_tokens=image_tokens, image_token_id=0, image_size=image.size))

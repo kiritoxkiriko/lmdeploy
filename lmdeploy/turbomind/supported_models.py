@@ -47,6 +47,7 @@ SUPPORTED_ARCHS = dict(
     # mixtral
     MixtralForCausalLM='mixtral',
     MolmoForCausalLM='molmo',
+    MLMInternVLChatModel='internvl',
 )
 
 
@@ -106,6 +107,9 @@ def is_supported(model_path: str):
                     # glm-4v-9b not supported
                     support_by_turbomind = False
             elif arch == 'InternVLChatModel':
+                llm_arch = cfg.llm_config.architectures[0]
+                support_by_turbomind = (llm_arch in SUPPORTED_ARCHS and _is_head_dim_supported(cfg.llm_config))
+            elif arch == 'MLMInternVLChatModel':
                 llm_arch = cfg.llm_config.architectures[0]
                 support_by_turbomind = (llm_arch in SUPPORTED_ARCHS and _is_head_dim_supported(cfg.llm_config))
             elif arch == 'LlavaForConditionalGeneration':
