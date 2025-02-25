@@ -5,8 +5,8 @@ on:
     tags:
       #- "v*.*.*"
       # match "v1.2.3-metric"
-      - "v*.*.*-metric"
-      - "v*.*.*.*-metric"
+      - "v*.*.*-metric*"
+      - "v*.*.*.*-metric*"
 
 jobs:
   docker:

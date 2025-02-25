@@ -10,7 +10,11 @@ ENV ENABLE_METRICS=1
 
 ENV ENABLE_LOG_REQUESTS=1
 
-COPY ./lmdeploy/serve/openai/api_server.py /tmp/api_server.py
+COPY ./lmdeploy/serve/openai/api_server.py /tmp/lmdeploy/serve/openai/api_server.py
+COPY ./lmdeploy/pytorch/configurations/mlminternvl.py /tmp/lmdeploy/pytorch/configurations/mlminternvl.py
+COPY ./lmdeploy/pytorch/models/mlminternvl.py /tmp/lmdeploy/pytorch/models/mlminternvl.py
+COPY ./lmdeploy/vl/model/mlminternvl.py /tmp/lmdeploy/vl/model/mlminternvl.py
+
 
 # add custom api_server.py to lmdeploy package dynamically by copying it to the package directory
-RUN mv /tmp/api_server.py $(pip show lmdeploy | grep Location | awk '{print $2}')/lmdeploy/serve/openai/api_server.py
+RUN mv /tmp/lmdeploy $(pip show lmdeploy | grep Location | awk '{print $2}')/
