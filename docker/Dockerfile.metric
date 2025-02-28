@@ -17,4 +17,7 @@ COPY ./lmdeploy/vl/model/mlminternvl.py /tmp/lmdeploy/vl/model/mlminternvl.py
 
 
 # add custom api_server.py to lmdeploy package dynamically by copying it to the package directory
-RUN mv /tmp/lmdeploy/* $(pip show lmdeploy | grep Location | awk '{print $2}')/lmdeploy
+RUN mv /tmp/lmdeploy/serve/openai/api_server.py $(pip show lmdeploy | grep Location | awk '{print $2}')/lmdeploy/serve/openai/api_server.py && \
+    mv /tmp/lmdeploy/pytorch/configurations/mlminternvl.py $(pip show lmdeploy | grep Location | awk '{print $2}')/lmdeploy/pytorch/configurations/mlminternvl.py && \
+    mv /tmp/lmdeploy/pytorch/models/mlminternvl.py $(pip show lmdeploy | grep Location | awk '{print $2}')/lmdeploy/pytorch/models/mlminternvl.py && \
+    mv /tmp/lmdeploy/vl/model/mlminternvl.py $(pip show lmdeploy | grep Location | awk '{print $2}')/lmdeploy/vl/model/mlminternvl.py
