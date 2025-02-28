@@ -17,4 +17,4 @@ COPY ./lmdeploy/vl/model/mlminternvl.py /tmp/lmdeploy/vl/model/mlminternvl.py
 
 
 # add custom api_server.py to lmdeploy package dynamically by copying it to the package directory
-RUN mv /tmp/lmdeploy $(pip show lmdeploy | grep Location | awk '{print $2}')
+RUN mv /tmp/lmdeploy/* $(pip show lmdeploy | grep Location | awk '{print $2}')/lmdeploy
