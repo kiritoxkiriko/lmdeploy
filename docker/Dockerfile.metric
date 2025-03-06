@@ -6,18 +6,20 @@ FROM openmmlab/lmdeploy:${VERSION}-cu12
 # add qwenvl-utils
 RUN pip install --no-cache-dir prometheus_fastapi_instrumentator qwen-vl-utils flash-attn timm autoawq
 
+RUN apt-get update && apt-get install -y rsync && apt-get clean
+
 ENV ENABLE_METRICS=1
 
 ENV ENABLE_LOG_REQUESTS=1
 
-COPY ./lmdeploy/serve/openai/api_server.py /tmp/lmdeploy/serve/openai/api_server.py
-COPY ./lmdeploy/pytorch/configurations/mlminternvl.py /tmp/lmdeploy/pytorch/configurations/mlminternvl.py
-COPY ./lmdeploy/pytorch/models/mlminternvl.py /tmp/lmdeploy/pytorch/models/mlminternvl.py
-COPY ./lmdeploy/vl/model/mlminternvl.py /tmp/lmdeploy/vl/model/mlminternvl.py
+COPY ./lmdeploy /tmp/lmdeploy
 
 
 # add custom api_server.py to lmdeploy package dynamically by copying it to the package directory
-RUN mv /tmp/lmdeploy/serve/openai/api_server.py $(pip show lmdeploy | grep Location | awk '{print $2}')/lmdeploy/serve/openai/api_server.py && \
-    mv /tmp/lmdeploy/pytorch/configurations/mlminternvl.py $(pip show lmdeploy | grep Location | awk '{print $2}')/lmdeploy/pytorch/configurations/mlminternvl.py && \
-    mv /tmp/lmdeploy/pytorch/models/mlminternvl.py $(pip show lmdeploy | grep Location | awk '{print $2}')/lmdeploy/pytorch/models/mlminternvl.py && \
-    mv /tmp/lmdeploy/vl/model/mlminternvl.py $(pip show lmdeploy | grep Location | awk '{print $2}')/lmdeploy/vl/model/mlminternvl.py
+RUN rsync -avP --remove-source-files  /tmp/lmdeploy  $(pip show lmdeploy | grep Location | awk '{print $2}')/
+
+
+#RUN mv /tmp/lmdeploy/serve/openai/api_server.py $(pip show lmdeploy | grep Location | awk '{print $2}')/lmdeploy/serve/openai/api_server.py && \
+    #mv /tmp/lmdeploy/pytorch/configurations/mlminternvl.py $(pip show lmdeploy | grep Location | awk '{print $2}')/lmdeploy/pytorch/configurations/mlminternvl.py && \
+    #mv /tmp/lmdeploy/pytorch/models/mlminternvl.py $(pip show lmdeploy | grep Location | awk '{print $2}')/lmdeploy/pytorch/models/mlminternvl.py && \
+    #mv /tmp/lmdeploy/vl/model/mlminternvl.py $(pip show lmdeploy | grep Location | awk '{print $2}')/lmdeploy/vl/model/mlminternvl.py
